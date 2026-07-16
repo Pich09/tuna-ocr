@@ -43,7 +43,10 @@ def ctc_greedy_decode(ctc_logits: torch.Tensor, ctc_blank_id: int) -> list:
 
 
 def load_model(checkpoint_path: Path, tokenizer: KhmerOcrTokenizer, device):
-    state = torch.load(checkpoint_path, map_location=device)
+    # weights_only=False: self-produced checkpoint (stores our own ModelConfig
+    # dataclass alongside the state dicts) -- see train.py's resume path for
+    # the same note on PyTorch 2.6+'s weights_only=True default.
+    state = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model_cfg = state["model_cfg"]
     model = Recognizer(model_cfg, tokenizer.vocab_size, bos_id=tokenizer.bos_id, pad_id=tokenizer.pad_id).to(device)
     model.load_state_dict(state["model_state_dict"])

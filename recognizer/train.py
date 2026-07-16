@@ -121,7 +121,11 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
 
     step = 0
     if resume_path:
-        state = torch.load(resume_path, map_location=device)
+        # weights_only=False: this checkpoint is self-produced (stores our own
+        # ModelConfig dataclass alongside the state dicts), not an untrusted
+        # third-party file -- PyTorch 2.6+'s weights_only=True default would
+        # otherwise reject the ModelConfig global.
+        state = torch.load(resume_path, map_location=device, weights_only=False)
         model.load_state_dict(state["model_state_dict"])
         optimizer.load_state_dict(state["optimizer_state_dict"])
         scheduler.load_state_dict(state["scheduler_state_dict"])
