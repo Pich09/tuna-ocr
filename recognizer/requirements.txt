@@ -1,0 +1,9 @@
+torch>=2.1
+sentencepiece
+khmer-nltk
+wordninja
+huggingface_hub
+editdistance
+Pillow>=10.0.0
+numpy
+tqdm

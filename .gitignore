@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+dataset/
+data_gen/samples/
+data_gen/generated_pdfs/
+data_gen/ocr_dataset/
+real_data/samples/
+
+recognizer/tokenizer/assets/
+recognizer/checkpoints/
+
+.ipynb_checkpoints/

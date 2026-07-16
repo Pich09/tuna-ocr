@@ -1,0 +1,6 @@
+Pillow>=10.0.0
+numpy
+PyYAML
+tqdm
+reportlab
+Faker
