@@ -2,10 +2,17 @@
 decoder), over real_data-only sources (see recognizer/config.py /
 recognizer/data/manifest.py -- data_gen synthetic output is out of scope).
 
+Run `real_data.deduplicate` first and pass its output via --dedup-manifest
+(preferred) so training never sees exact/near-duplicate images across
+sources; --real-data-dirs (raw, undeduplicated per-source manifests) is
+still supported for quick iteration but skips that dedup pass.
+
 CLI:
-    python -m recognizer.train --real-data-dirs real_data/samples/deepcopy_khmer_text_recognition \\
+    python -m real_data.deduplicate --real-data-dirs real_data/samples/deepcopy_khmer_text_recognition \\
         real_data/samples/chanrith_ocr_image_line real_data/samples/darayut_scene_text \\
-        real_data/samples/sokheng_synthetic_v1 \\
+        real_data/samples/sokheng_synthetic_v1 --out-dir real_data/samples/dedup
+
+    python -m recognizer.train --dedup-manifest real_data/samples/dedup/manifest.tsv \\
         --tokenizer-dir recognizer/tokenizer/assets --run-name v1
 
 Runs on CPU, CUDA, or TPU -- the device is auto-detected (see env_utils.py)
@@ -32,7 +39,7 @@ from torch.utils.data import DataLoader
 from . import env_utils
 from .config import ModelConfig, TrainConfig, DEFAULT_CHECKPOINT_ROOT, TOKENIZER_ASSETS_DIR
 from .data.dataset import BucketBatchSampler, OCRLineDataset, make_collate_fn
-from .data.manifest import build_combined_index
+from .data.manifest import build_combined_index, load_dedup_manifest
 from .hf_push import push_checkpoint
 from .modules.model import Recognizer
 from .tokenizer.khmer_ocr_tokenizer import KhmerOcrTokenizer
@@ -89,10 +96,13 @@ def compute_loss(ctc_logits, ar_logits, batch, ctc_weight: float, pad_id: int, c
     return loss, ctc_loss, ce_loss
 
 
-def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots, tokenizer_dir=TOKENIZER_ASSETS_DIR,
-                  checkpoint_root=DEFAULT_CHECKPOINT_ROOT, run_name: str = "v1", push_to_hub: bool = False,
-                  repo_id=None, hf_token=None, hub_private: bool = True, auto_batch_size: bool = False,
-                  resume_path=None, device=None):
+def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots=None, dedup_manifest_path=None,
+                  tokenizer_dir=TOKENIZER_ASSETS_DIR, checkpoint_root=DEFAULT_CHECKPOINT_ROOT, run_name: str = "v1",
+                  push_to_hub: bool = False, repo_id=None, hf_token=None, hub_private: bool = True,
+                  auto_batch_size: bool = False, resume_path=None, device=None):
+    """Exactly one of `dedup_manifest_path` (preferred -- output of
+    `real_data.deduplicate`) or `real_data_roots` (raw, undeduplicated
+    per-source manifests) must be given."""
     device = device or env_utils.get_torch_device()
     is_xla = device.type == "xla"
     xm = None
@@ -101,10 +111,16 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
     torch.manual_seed(train_cfg.seed)
 
     tokenizer = KhmerOcrTokenizer(tokenizer_dir)
-    samples = build_combined_index(real_data_roots)
+    if dedup_manifest_path:
+        samples = load_dedup_manifest(dedup_manifest_path)
+    elif real_data_roots:
+        samples = build_combined_index(real_data_roots)
+    else:
+        raise ValueError("run_training needs either dedup_manifest_path or real_data_roots")
     if not samples:
-        raise RuntimeError(f"No is_full_line samples found under {real_data_roots} -- generate them first with "
-                            f"`python -m real_data.generate_external_chunks`.")
+        raise RuntimeError(f"No samples found (dedup_manifest_path={dedup_manifest_path}, "
+                            f"real_data_roots={real_data_roots}) -- generate/deduplicate data first with "
+                            f"`python -m real_data.generate_external_chunks` and `python -m real_data.deduplicate`.")
     n_val = max(1, int(len(samples) * train_cfg.val_frac))
     train_samples, val_samples = samples[n_val:], samples[:n_val]
 
@@ -199,7 +215,11 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--real-data-dirs", nargs="+", required=True)
+    data_group = parser.add_mutually_exclusive_group(required=True)
+    data_group.add_argument("--dedup-manifest", type=Path,
+                             help="Output of `real_data.deduplicate` -- preferred over --real-data-dirs.")
+    data_group.add_argument("--real-data-dirs", nargs="+",
+                             help="Raw, undeduplicated per-source manifests (skips the dedup pass).")
     parser.add_argument("--tokenizer-dir", type=Path, default=TOKENIZER_ASSETS_DIR)
     parser.add_argument("--checkpoint-root", type=Path, default=DEFAULT_CHECKPOINT_ROOT)
     parser.add_argument("--run-name", default="v1")
@@ -228,10 +248,10 @@ def main():
         train_cfg.ckpt_every = args.ckpt_every
 
     run_training(
-        model_cfg, train_cfg, args.real_data_dirs, tokenizer_dir=args.tokenizer_dir,
-        checkpoint_root=args.checkpoint_root, run_name=args.run_name, push_to_hub=args.push_to_hub,
-        hf_token=args.hf_token, hub_private=not args.hub_public, auto_batch_size=args.auto_batch_size,
-        resume_path=args.resume,
+        model_cfg, train_cfg, real_data_roots=args.real_data_dirs, dedup_manifest_path=args.dedup_manifest,
+        tokenizer_dir=args.tokenizer_dir, checkpoint_root=args.checkpoint_root, run_name=args.run_name,
+        push_to_hub=args.push_to_hub, hf_token=args.hf_token, hub_private=not args.hub_public,
+        auto_batch_size=args.auto_batch_size, resume_path=args.resume,
     )
 
 

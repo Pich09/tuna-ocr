@@ -21,8 +21,9 @@ tuna-ocr/
   data_gen/         synthetic document generator (lines, pages, ID cards, letters,
                      birth certificates) for the YOLO layout detector and OCR
                      line recognizer -- see data_gen/README.md
-  real_data/        pulls line images + transcripts from 5 external Hugging Face
-                     OCR datasets, slices them into overlapping chunks for
+  real_data/        pulls line images + transcripts from 4 external Hugging Face
+                     OCR datasets, deduplicates across them (exact + near-duplicate
+                     image detection), and slices them into overlapping chunks for
                      Conformer-encoder input windowing -- see real_data/README.md
   recognizer/       the OCR recognizer model itself: Conformer encoder +
                      blockwise-AR decoder, trained on real_data's output, using
@@ -134,15 +135,20 @@ pip install -r data_gen/requirements.txt -r real_data/requirements.txt -r recogn
 # pull real training data (4 configured sources, printed text -- see real_data/config.py)
 python -m real_data.generate_external_chunks --source all --num-samples 500
 
+# dedup across sources (exact + near-duplicate images) before training
+python -m real_data.deduplicate \
+    --real-data-dirs real_data/samples/deepcopy_khmer_text_recognition \
+                     real_data/samples/chanrith_ocr_image_line \
+                     real_data/samples/darayut_scene_text \
+                     real_data/samples/sokheng_synthetic_v1 \
+    --out-dir real_data/samples/dedup
+
 # fetch the shared tokenizer
 python -m recognizer.tokenizer.fetch_tokenizer --out-dir recognizer/tokenizer/assets
 
 # train
 python -m recognizer.train \
-    --real-data-dirs real_data/samples/deepcopy_khmer_text_recognition \
-                     real_data/samples/chanrith_ocr_image_line \
-                     real_data/samples/darayut_scene_text \
-                     real_data/samples/sokheng_synthetic_v1 \
+    --dedup-manifest real_data/samples/dedup/manifest.tsv \
     --tokenizer-dir recognizer/tokenizer/assets --run-name v1
 
 # evaluate / run inference

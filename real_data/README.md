@@ -13,16 +13,28 @@ real_data/
   chunking.py                   chunk_image_overlap() -- pure PIL.Image -> chunks, no network deps
   hf_datasets.py                 HF `datasets` streaming loader + column auto-detect
   generate_external_chunks.py   CLI -> images + manifest.tsv
+  dedup.py                       exact (SHA-256) + near-duplicate (perceptual hash) detection -- pure functions
+  deduplicate.py                 CLI -> pools + deduplicates one or more pulled sources into one manifest
   requirements.txt
-  samples/                       example output from generate_external_chunks.py
+  samples/                       example output from generate_external_chunks.py / deduplicate.py
 ```
 
 ## Quick start
 
 ```bash
-pip install -r real_data/requirements.txt   # datasets, huggingface_hub, Pillow, tqdm
+pip install -r real_data/requirements.txt   # datasets, huggingface_hub, Pillow, tqdm, ImageHash
 python -m real_data.generate_external_chunks --source darayut_scene_text --num-samples 100
 python -m real_data.generate_external_chunks --source all --num-samples 50
+
+# then deduplicate before handing data to recognizer.train (see below) --
+# list each pulled source explicitly, not a glob (a glob would also match
+# the dedup/ output directory itself once created)
+python -m real_data.deduplicate \
+    --real-data-dirs real_data/samples/deepcopy_khmer_text_recognition \
+                     real_data/samples/chanrith_ocr_image_line \
+                     real_data/samples/darayut_scene_text \
+                     real_data/samples/sokheng_synthetic_v1 \
+    --out-dir real_data/samples/dedup
 ```
 
 ## External-source data + chunking
@@ -65,3 +77,35 @@ column, first remaining `str` column); ambiguous detection raises rather
 than guessing. A source that fails to load (network, gated, schema
 mismatch) is skipped with a clear message under `--source all`, or
 hard-fails under a single named `--source`.
+
+## Deduplication (`dedup.py` / `deduplicate.py`)
+
+Run `real_data.deduplicate` after pulling and before handing data to
+`recognizer.train` -- it pools the `is_full_line` (whole-line) rows across
+however many pulled source directories you give it and removes:
+
+- **Exact duplicates** (SHA-256 of the raw image bytes) -- e.g. the same
+  row appearing twice, or two sources that turn out to mirror the same
+  underlying data under different names/accounts.
+- **Near-duplicates** (`imagehash.phash`, Hamming distance <=
+  `--near-dup-threshold`, default 4) -- e.g. a re-compressed/re-encoded
+  copy that isn't byte-identical but is the same line image.
+
+It does **not** remove same-transcript-different-image rows -- many
+distinct images can legitimately share a transcript (common Khmer words
+rendered by different writers/fonts/backgrounds), so that's reported as an
+informational count (`duplicate_text_count_informational` in the JSON
+report), not filtered.
+
+Output: a single pooled `manifest.tsv` (columns: `image_path` [absolute],
+`text`, `source`, `line_id`) plus `dedup_report.json` (counts, per-source
+survivor counts, and up to 20 example duplicate groups of each kind, for
+spot-checking). `recognizer.train`'s `--dedup-manifest` flag (preferred
+over `--real-data-dirs`) points straight at this manifest.
+
+Near-duplicate detection is brute-force pairwise comparison over the
+exact-dedup survivors -- O(n²), fine at the scale these pulls operate at
+(hundreds to a few thousand samples per source) but not something that
+would scale to a full multi-million-row pull without an LSH/BK-tree index;
+noted as a known limitation in `dedup.py`'s docstring, not implemented
+since it isn't needed at current pull sizes.

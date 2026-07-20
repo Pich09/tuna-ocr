@@ -81,13 +81,23 @@ python -m recognizer.tokenizer.fetch_tokenizer --out-dir recognizer/tokenizer/as
 
 ```bash
 python -m real_data.generate_external_chunks --source all --num-samples 500
-python -m recognizer.train \
+
+# dedup before training -- see real_data/README.md's "Deduplication" section
+python -m real_data.deduplicate \
     --real-data-dirs real_data/samples/deepcopy_khmer_text_recognition \
                      real_data/samples/chanrith_ocr_image_line \
                      real_data/samples/darayut_scene_text \
                      real_data/samples/sokheng_synthetic_v1 \
+    --out-dir real_data/samples/dedup
+
+python -m recognizer.train \
+    --dedup-manifest real_data/samples/dedup/manifest.tsv \
     --tokenizer-dir recognizer/tokenizer/assets --run-name v1
 ```
+
+`--dedup-manifest` (preferred) points at `real_data.deduplicate`'s pooled,
+deduplicated output; `--real-data-dirs` (raw per-source manifests, no
+dedup pass) is still accepted for quick iteration.
 
 Loss is hybrid CTC (auxiliary, over the full non-windowed encoder output,
 `ctc_weight=0.3`) + AR cross-entropy -- the CTC term induces the
