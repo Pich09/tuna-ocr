@@ -8,6 +8,13 @@ CLI:
         real_data/samples/soyvitou_handwritten real_data/samples/sokheng_synthetic_v1 \\
         --tokenizer-dir recognizer/tokenizer/assets --run-name v1
 
+Runs on CPU, CUDA, or TPU -- the device is auto-detected (see env_utils.py)
+unless explicitly passed. TPU note: PyTorch/XLA's CTC op support has
+historically been spotty across versions; if `compute_loss`'s CTCLoss call
+errors or silently falls back to a slow CPU path on your TPU runtime,
+that's a torch_xla limitation, not a bug in this file -- report the exact
+error rather than assuming it's this code.
+
 Also exposes `run_training(...)` as a plain callable so the Colab/Kaggle/
 local notebook (notebooks/train_recognizer.ipynb) can drive training
 directly instead of shelling out to this CLI.
@@ -22,6 +29,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
+from . import env_utils
 from .config import ModelConfig, TrainConfig, DEFAULT_CHECKPOINT_ROOT, TOKENIZER_ASSETS_DIR
 from .data.dataset import BucketBatchSampler, OCRLineDataset, make_collate_fn
 from .data.manifest import build_combined_index
@@ -32,8 +40,9 @@ from .tokenizer.khmer_ocr_tokenizer import KhmerOcrTokenizer
 
 def find_max_batch_size(model, dataset, collate_fn, device, start: int = 64, min_batch: int = 1) -> int:
     """OOM-probing auto-tune: try `start`, halve on CUDA OOM until a batch
-    fits (forward + backward). CPU/MPS just use the configured default --
-    this is only meaningful where OOM is a real risk."""
+    fits (forward + backward). CPU/TPU just use the configured default --
+    on TPU, memory errors don't surface as a catchable Python OOM the same
+    way (XLA compiles lazily), so this probe isn't meaningful there."""
     if device.type != "cuda":
         return start
     bs = start
@@ -84,7 +93,11 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
                   checkpoint_root=DEFAULT_CHECKPOINT_ROOT, run_name: str = "v1", push_to_hub: bool = False,
                   repo_id=None, hf_token=None, hub_private: bool = True, auto_batch_size: bool = False,
                   resume_path=None, device=None):
-    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = device or env_utils.get_torch_device()
+    is_xla = device.type == "xla"
+    xm = None
+    if is_xla:
+        import torch_xla.core.xla_model as xm  # noqa: PLC0415
     torch.manual_seed(train_cfg.seed)
 
     tokenizer = KhmerOcrTokenizer(tokenizer_dir)
@@ -124,8 +137,10 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
         # weights_only=False: this checkpoint is self-produced (stores our own
         # ModelConfig dataclass alongside the state dicts), not an untrusted
         # third-party file -- PyTorch 2.6+'s weights_only=True default would
-        # otherwise reject the ModelConfig global.
-        state = torch.load(resume_path, map_location=device, weights_only=False)
+        # otherwise reject the ModelConfig global. map_location="cpu": XLA
+        # devices aren't reliably understood by map_location -- load_state_dict
+        # onto the already-.to(device)'d model handles the actual placement.
+        state = torch.load(resume_path, map_location="cpu", weights_only=False)
         model.load_state_dict(state["model_state_dict"])
         optimizer.load_state_dict(state["optimizer_state_dict"])
         scheduler.load_state_dict(state["scheduler_state_dict"])
@@ -146,7 +161,10 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
             )
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            optimizer.step()
+            if is_xla:
+                xm.optimizer_step(optimizer)  # reduces gradients across cores + steps + marks the XLA graph
+            else:
+                optimizer.step()
             scheduler.step()
             step += 1
 
@@ -165,8 +183,9 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
                     "optimizer_state_dict": optimizer.state_dict(),
                     "scheduler_state_dict": scheduler.state_dict(), "model_cfg": model_cfg,
                 }
-                torch.save(state, ckpt_path)
-                torch.save(state, ckpt_dir / "last.pt")
+                save_fn = xm.save if is_xla else torch.save  # xm.save moves XLA tensors to CPU before writing
+                save_fn(state, ckpt_path)
+                save_fn(state, ckpt_dir / "last.pt")
                 print(f"saved checkpoint {ckpt_path}")
                 if push_to_hub:
                     kwargs = {"token": hf_token, "private": hub_private}

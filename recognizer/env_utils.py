@@ -1,6 +1,7 @@
 """Detects which platform training is running on (Colab / Kaggle / local) and
-resolves the checkpoint root + HF token accordingly, so the same train.py
-code/notebook works unmodified in all three places.
+which accelerator is available (TPU / GPU / CPU), and resolves the
+checkpoint root + HF token accordingly, so the same train.py code/notebook
+works unmodified everywhere.
 """
 import os
 from pathlib import Path
@@ -10,14 +11,50 @@ from .config import DEFAULT_CHECKPOINT_ROOT
 DRIVE_CHECKPOINT_ROOT = Path("/content/drive/My Drive/tuna-ocr/checkpoints")
 KAGGLE_CHECKPOINT_ROOT = Path("/kaggle/working/tuna-ocr/checkpoints")
 
+# Any of these being set is how Colab/Kaggle/GCP advertise a TPU runtime --
+# checked before ever importing torch_xla, since importing it with no TPU
+# present is either an error or an expensive no-op.
+_TPU_ENV_VARS = ("COLAB_TPU_ADDR", "TPU_NAME", "XRT_TPU_CONFIG")
+
 
 def detect_environment() -> str:
     """Returns 'colab', 'kaggle', or 'local'."""
-    if "COLAB_RELEASE_TAG" in os.environ or "COLAB_GPU" in os.environ:
+    if "COLAB_RELEASE_TAG" in os.environ or "COLAB_GPU" in os.environ or "COLAB_TPU_ADDR" in os.environ:
         return "colab"
     if "KAGGLE_KERNEL_RUN_TYPE" in os.environ or Path("/kaggle/working").is_dir():
         return "kaggle"
     return "local"
+
+
+def detect_accelerator() -> str:
+    """Returns 'tpu', 'cuda', or 'cpu'. TPU is checked first since a TPU
+    runtime has no CUDA device to report."""
+    if any(v in os.environ for v in _TPU_ENV_VARS):
+        return "tpu"
+    import torch
+
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def get_torch_device():
+    """Returns the torch.device to train on, importing torch_xla only when a
+    TPU was actually detected. Raises with an actionable message if a TPU is
+    advertised but torch_xla isn't installed -- Colab/Kaggle TPU runtimes
+    ship it preinstalled, but a custom environment might not."""
+    accel = detect_accelerator()
+    if accel == "tpu":
+        try:
+            import torch_xla.core.xla_model as xm  # noqa: PLC0415
+        except ImportError as exc:
+            raise RuntimeError(
+                "A TPU runtime was detected (TPU env var present) but torch_xla isn't "
+                "installed. On Colab/Kaggle, select the TPU runtime/accelerator (which "
+                "ships torch_xla preinstalled) rather than pip-installing it manually."
+            ) from exc
+        return xm.xla_device()
+    import torch
+
+    return torch.device("cuda" if accel == "cuda" else "cpu")
 
 
 def get_checkpoint_root(env: str = None) -> Path:

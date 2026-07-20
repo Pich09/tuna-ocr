@@ -9,6 +9,7 @@ from pathlib import Path
 
 import torch
 
+from . import env_utils
 from .config import TOKENIZER_ASSETS_DIR
 from .data.transforms import chunk_line_image
 from .evaluate import load_model
@@ -18,13 +19,13 @@ from .tokenizer.khmer_ocr_tokenizer import KhmerOcrTokenizer
 @torch.no_grad()
 def infer(checkpoint_path: Path, image_path: Path, tokenizer_dir=TOKENIZER_ASSETS_DIR, keep_tags: bool = False,
            max_len: int = 256, device=None):
-    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = device or env_utils.get_torch_device()
     tokenizer = KhmerOcrTokenizer(tokenizer_dir)
     model, model_cfg = load_model(checkpoint_path, tokenizer, device)
 
     chunk_tensors, _ = chunk_line_image(image_path, model_cfg.chunk_width, model_cfg.chunk_overlap, model_cfg.img_height)
     chunk_batch = torch.stack(chunk_tensors).to(device)
-    chunks_per_line = torch.tensor([len(chunk_tensors)], dtype=torch.long)
+    chunks_per_line = torch.tensor([len(chunk_tensors)], dtype=torch.long, device=device)
 
     enc_out, enc_lengths, enc_block_ids = model.encode(chunk_batch, chunks_per_line)
     max_blocks = min(len(chunk_tensors), max_len // max(1, model_cfg.max_tokens_per_block) + 1)

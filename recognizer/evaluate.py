@@ -15,6 +15,7 @@ import editdistance
 import torch
 from torch.utils.data import DataLoader
 
+from . import env_utils
 from .config import ModelConfig, TOKENIZER_ASSETS_DIR
 from .data.dataset import OCRLineDataset, make_collate_fn
 from .data.manifest import build_combined_index
@@ -46,7 +47,10 @@ def load_model(checkpoint_path: Path, tokenizer: KhmerOcrTokenizer, device):
     # weights_only=False: self-produced checkpoint (stores our own ModelConfig
     # dataclass alongside the state dicts) -- see train.py's resume path for
     # the same note on PyTorch 2.6+'s weights_only=True default.
-    state = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    # map_location="cpu" always: torch.load's map_location doesn't reliably
+    # understand XLA devices, so load to CPU and let model.to(device) below
+    # move it (works identically for cuda/cpu/xla).
+    state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     model_cfg = state["model_cfg"]
     model = Recognizer(model_cfg, tokenizer.vocab_size, bos_id=tokenizer.bos_id, pad_id=tokenizer.pad_id).to(device)
     model.load_state_dict(state["model_state_dict"])
@@ -57,7 +61,7 @@ def load_model(checkpoint_path: Path, tokenizer: KhmerOcrTokenizer, device):
 @torch.no_grad()
 def evaluate(checkpoint_path: Path, real_data_roots, tokenizer_dir=TOKENIZER_ASSETS_DIR, batch_size: int = 16,
              device=None):
-    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = device or env_utils.get_torch_device()
     tokenizer = KhmerOcrTokenizer(tokenizer_dir)
     model, model_cfg = load_model(checkpoint_path, tokenizer, device)
 

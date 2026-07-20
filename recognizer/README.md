@@ -102,6 +102,23 @@ push to the `Panhapich/tuna-ocr` HF repo, use
 `notebooks/train_recognizer.ipynb` instead of the bare CLI -- see its first
 cell for platform setup (Drive mount, HF secret name: `HF_TOKEN`).
 
+### CPU / GPU / TPU
+
+The training device is auto-detected (`env_utils.get_torch_device()`) --
+CLI and notebook both pick it up with no flag needed:
+- **GPU**: batch size is auto-probed to fit available VRAM
+  (`--auto-batch-size` / the notebook's `auto_batch_size=True`) by trying a
+  candidate size and halving on CUDA OOM.
+- **TPU**: select the TPU runtime/accelerator on Colab or Kaggle *before*
+  starting (both ship `torch_xla` preinstalled there -- no extra install
+  needed). Training uses `xm.optimizer_step`/`xm.save` instead of the plain
+  `optimizer.step`/`torch.save` calls. The VRAM auto-probe is skipped on TPU
+  (XLA doesn't surface a catchable Python OOM the same way); the configured
+  `batch_size` is used as-is. **Caveat**: PyTorch/XLA's CTC op support has
+  historically been inconsistent across versions -- if `compute_loss`'s
+  `F.ctc_loss` call errors or is unexpectedly slow on your TPU runtime,
+  check for a CPU fallback before assuming it's a bug in this repo.
+
 ## Evaluation / inference
 
 ```bash
@@ -129,3 +146,7 @@ accuracy, since Khmer word boundaries are themselves ambiguous).
 - No distributed training, tuned mixed precision, or hyperparameter search
   -- out of scope for this pass. A bare `--amp` flag may be added cheaply
   later if needed.
+- TPU support runs on a single core only -- a multi-core TPU (e.g. Colab's
+  v2-8/v3-8) is not parallelized across cores (`xmp.spawn` / multi-core
+  `MpDeviceLoader`), so most of an 8-core TPU's throughput goes unused.
+  Follow-up work, not required for this to run correctly on TPU today.
