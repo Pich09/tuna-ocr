@@ -87,9 +87,19 @@ however many pulled source directories you give it and removes:
 - **Exact duplicates** (SHA-256 of the raw image bytes) -- e.g. the same
   row appearing twice, or two sources that turn out to mirror the same
   underlying data under different names/accounts.
-- **Near-duplicates** (`imagehash.phash`, Hamming distance <=
-  `--near-dup-threshold`, default 4) -- e.g. a re-compressed/re-encoded
-  copy that isn't byte-identical but is the same line image.
+- **Near-duplicates** (`imagehash.phash` at `hash_size=16`, Hamming
+  distance <= `--near-dup-threshold`, default 10) -- e.g. a
+  re-compressed/re-encoded copy that isn't byte-identical but is the same
+  line image. These defaults were tuned empirically, not guessed: OCR line
+  crops are mostly-uniform background + thin text, so `imagehash`'s
+  *default* `hash_size=8` is too coarse for them -- caught a real
+  false-positive while building this pipeline, where two genuinely
+  different `chanrith_ocr_image_line` rows (completely different text)
+  measured Hamming distance 4 at `hash_size=8`, exactly at the threshold
+  originally used here. At `hash_size=16` the same pair separates to
+  distance 114, while a true near-duplicate (the same image re-compressed
+  at quality=50) measures distance 2 -- see `dedup.py`'s `find_duplicates`
+  docstring for the full comparison.
 
 It does **not** remove same-transcript-different-image rows -- many
 distinct images can legitimately share a transcript (common Khmer words

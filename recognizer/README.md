@@ -102,9 +102,42 @@ dedup pass) is still accepted for quick iteration.
 Loss is hybrid CTC (auxiliary, over the full non-windowed encoder output,
 `ctc_weight=0.3`) + AR cross-entropy -- the CTC term induces the
 left-to-right monotonic image/text correspondence the block-restricted
-cross-attention depends on. Logs `step, loss, ctc_loss, ce_loss, lr` every
-`log_every=100` steps (stdout + `checkpoints/run_name/train_log.csv`); saves
-a full checkpoint every `ckpt_every=10_000` steps.
+cross-attention depends on.
+
+### Logging, checkpoints, resuming
+
+Every `log_every=100` steps, `run_training` reports `step, epoch, loss,
+ctc_loss, ce_loss, lr` to **three** places (all under
+`checkpoint_root/run_name/`, local disk by default -- see
+`recognizer/config.py`'s `DEFAULT_CHECKPOINT_ROOT`):
+- **`train.log`** -- timestamped, human-readable, the one meant to be read
+  directly (`tail -f checkpoints/<run_name>/train.log` while training runs).
+  Also captures auto-batch-size selection, resume events, checkpoint
+  saves/pushes, and a training-complete summary -- not just the per-step
+  loss line.
+- **`train_log.csv`** -- pure numeric, for later plotting/analysis.
+- stdout (same lines as `train.log`, via a `logging.StreamHandler`).
+
+`epoch` is estimated as `step / (len(train_samples) // batch_size)` and
+logged alongside `step` specifically so you can tell whether you're on
+your first pass over the data or the 50th (small local pulls repeat many
+times over a long `max_steps` run -- see the epoch-size discussion this
+project's chat history covers, if you have it).
+
+A full checkpoint (model + optimizer + scheduler state + `model_cfg`) is
+saved locally every `ckpt_every=10_000` steps to
+`checkpoint_root/run_name/step_<N>.pt`, and `last.pt` is overwritten every
+time too. **To continue training from a local checkpoint**, pass
+`--resume checkpoints/<run_name>/last.pt` (or a specific `step_<N>.pt`) --
+this restores `step`/model/optimizer/scheduler state exactly, so training
+picks up where it left off rather than restarting the LR schedule or
+losing optimizer momentum:
+
+```bash
+python -m recognizer.train --dedup-manifest real_data/samples/dedup/manifest.tsv \
+    --tokenizer-dir recognizer/tokenizer/assets --run-name v1 \
+    --resume recognizer/checkpoints/v1/last.pt
+```
 
 For Colab/Kaggle/local with adaptive batch sizing and automatic checkpoint
 push to the `Panhapich/tuna-ocr` HF repo, use

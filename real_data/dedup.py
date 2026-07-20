@@ -62,16 +62,28 @@ def sha256_file(path: Path, chunk_size: int = 65536) -> str:
     return h.hexdigest()
 
 
-def phash(path: Path, hash_size: int = 8):
+def phash(path: Path, hash_size: int = 16):
     import imagehash
 
     with Image.open(path) as img:
         return imagehash.phash(img, hash_size=hash_size)
 
 
-def find_duplicates(records: list, near_dup_threshold: int = 4) -> DedupResult:
+def find_duplicates(records: list, near_dup_threshold: int = 10, hash_size: int = 16) -> DedupResult:
     """records: list[Record], already in the priority order ties should
-    resolve by (earlier record in the list wins and is kept)."""
+    resolve by (earlier record in the list wins and is kept).
+
+    hash_size/near_dup_threshold defaults were tuned empirically, not
+    guessed: OCR line crops are mostly-uniform background + thin text, so
+    the DEFAULT imagehash.phash hash_size=8 (a 64-bit hash / 8x8 DCT) is too
+    coarse for them -- two genuinely different line images (different text
+    entirely) measured Hamming distance 4 at hash_size=8, exactly at the
+    threshold that was originally used here, causing a real false-positive
+    removal (verified against real_data/samples/chanrith_ocr_image_line
+    while building this pipeline). At hash_size=16 (256-bit hash) the same
+    pair separates to distance 114, while a genuine near-duplicate (the same
+    image re-JPEG-compressed at quality=50) measures distance 2 -- a huge,
+    clean margin. near_dup_threshold=10 sits safely inside that margin."""
     # -- pass 1: exact byte-identical duplicates --
     by_sha = {}
     for r in records:
@@ -88,7 +100,7 @@ def find_duplicates(records: list, near_dup_threshold: int = 4) -> DedupResult:
     near_groups, near_dup_count = [], 0
     kept = survivors
     if near_dup_threshold > 0 and len(survivors) > 1:
-        hashes = [(r, phash(r.image_path)) for r in survivors]
+        hashes = [(r, phash(r.image_path, hash_size=hash_size)) for r in survivors]
         consumed = [False] * len(hashes)
         kept = []
         for i, (r_i, h_i) in enumerate(hashes):

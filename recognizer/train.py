@@ -28,6 +28,7 @@ directly instead of shelling out to this CLI.
 """
 import argparse
 import csv
+import logging
 import math
 import time
 from pathlib import Path
@@ -43,6 +44,28 @@ from .data.manifest import build_combined_index, load_dedup_manifest
 from .hf_push import push_checkpoint
 from .modules.model import Recognizer
 from .tokenizer.khmer_ocr_tokenizer import KhmerOcrTokenizer
+
+
+def build_logger(ckpt_dir: Path, run_name: str) -> logging.Logger:
+    """Every training-status line (auto batch size, resume, per-step
+    metrics, checkpoint saves/pushes) goes through this logger instead of
+    bare print(), so it's captured in `ckpt_dir/train.log` (timestamped,
+    human-readable) as well as stdout -- print() alone is lost the moment
+    the terminal/notebook session closes. `train_log.csv` (written
+    separately, see run_training) stays purely numeric for later plotting;
+    this .log file is the one meant to be read directly."""
+    logger = logging.getLogger(f"recognizer.train.{run_name}")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()  # re-entrant safe: run_training may be called more than once per process (e.g. notebook)
+    logger.propagate = False
+    fmt = logging.Formatter("%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    file_handler = logging.FileHandler(ckpt_dir / "train.log")
+    file_handler.setFormatter(fmt)
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(fmt)
+    logger.addHandler(file_handler)
+    logger.addHandler(stream_handler)
+    return logger
 
 
 def find_max_batch_size(model, dataset, collate_fn, device, start: int = 64, min_batch: int = 1) -> int:
@@ -129,10 +152,20 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
 
     model = Recognizer(model_cfg, tokenizer.vocab_size, bos_id=tokenizer.bos_id, pad_id=tokenizer.pad_id).to(device)
 
+    ckpt_dir = Path(checkpoint_root) / run_name
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    logger = build_logger(ckpt_dir, run_name)
+    logger.info(f"run '{run_name}': device={device}, {len(train_samples)} train / {len(val_samples)} val samples, "
+                f"checkpoints -> {ckpt_dir}, log file -> {ckpt_dir / 'train.log'}")
+
     batch_size = train_cfg.batch_size
     if auto_batch_size:
         batch_size = find_max_batch_size(model, train_ds, collate_fn, device, start=max(64, train_cfg.batch_size))
-        print(f"auto batch size: {batch_size}")
+        logger.info(f"auto batch size: {batch_size}")
+
+    steps_per_epoch = max(1, len(train_ds) // batch_size)
+    logger.info(f"batch_size={batch_size}, ~{steps_per_epoch} steps/epoch, max_steps={train_cfg.max_steps} "
+                f"(~{train_cfg.max_steps / steps_per_epoch:.1f} epochs)")
 
     sampler = BucketBatchSampler(train_ds, batch_size=batch_size, shuffle=True)
     loader = DataLoader(train_ds, batch_sampler=sampler, collate_fn=collate_fn)
@@ -142,11 +175,9 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
         optimizer, lambda step: lr_lambda(step, train_cfg.warmup_steps, train_cfg.max_steps),
     )
 
-    ckpt_dir = Path(checkpoint_root) / run_name
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
     log_path = ckpt_dir / "train_log.csv"
     if not log_path.exists():
-        log_path.write_text("step,loss,ctc_loss,ce_loss,lr\n")
+        log_path.write_text("step,epoch,loss,ctc_loss,ce_loss,lr\n")
 
     step = 0
     if resume_path:
@@ -161,7 +192,8 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
         optimizer.load_state_dict(state["optimizer_state_dict"])
         scheduler.load_state_dict(state["scheduler_state_dict"])
         step = state["step"]
-        print(f"resumed from {resume_path} at step {step}")
+        logger.info(f"resumed from {resume_path} at step {step} "
+                    f"({train_cfg.max_steps - step} steps remaining to max_steps={train_cfg.max_steps})")
 
     ctc_blank_id = tokenizer.vocab_size
     model.train()
@@ -187,10 +219,11 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
             if step % train_cfg.log_every == 0:
                 lr = scheduler.get_last_lr()[0]
                 elapsed = time.time() - t0
-                print(f"step {step} loss {loss.item():.4f} ctc {ctc_loss.item():.4f} "
-                      f"ce {ce_loss.item():.4f} lr {lr:.2e} ({elapsed:.1f}s)")
+                epoch = step / steps_per_epoch
+                logger.info(f"step {step} epoch {epoch:.2f} loss {loss.item():.4f} ctc {ctc_loss.item():.4f} "
+                            f"ce {ce_loss.item():.4f} lr {lr:.2e} ({elapsed:.1f}s)")
                 with log_path.open("a", newline="") as f:
-                    csv.writer(f).writerow([step, loss.item(), ctc_loss.item(), ce_loss.item(), lr])
+                    csv.writer(f).writerow([step, f"{epoch:.4f}", loss.item(), ctc_loss.item(), ce_loss.item(), lr])
 
             if step % train_cfg.ckpt_every == 0:
                 ckpt_path = ckpt_dir / f"step_{step:07d}.pt"
@@ -202,14 +235,16 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
                 save_fn = xm.save if is_xla else torch.save  # xm.save moves XLA tensors to CPU before writing
                 save_fn(state, ckpt_path)
                 save_fn(state, ckpt_dir / "last.pt")
-                print(f"saved checkpoint {ckpt_path}")
+                logger.info(f"saved checkpoint {ckpt_path} (and {ckpt_dir / 'last.pt'} -- "
+                            f"resume from either with --resume)")
                 if push_to_hub:
                     kwargs = {"token": hf_token, "private": hub_private}
                     if repo_id:
                         kwargs["repo_id"] = repo_id
                     url = push_checkpoint(ckpt_path, **kwargs)
-                    print(f"pushed checkpoint to {url}")
+                    logger.info(f"pushed checkpoint to {url}")
 
+    logger.info(f"training complete: {step} steps, checkpoints + log in {ckpt_dir}")
     return model
 
 

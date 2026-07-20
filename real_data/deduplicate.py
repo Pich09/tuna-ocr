@@ -48,9 +48,11 @@ def main():
     parser.add_argument("--real-data-dirs", nargs="+", required=True,
                          help="One or more real_data/samples/<source> directories to pool and deduplicate.")
     parser.add_argument("--out-dir", type=Path, default=REAL_DATA_ROOT / "samples" / "dedup")
-    parser.add_argument("--near-dup-threshold", type=int, default=4,
-                         help="Perceptual-hash Hamming distance <= this counts as a near-duplicate. "
-                              "0 disables near-duplicate detection (exact-hash dedup only).")
+    parser.add_argument("--near-dup-threshold", type=int, default=10,
+                         help="Perceptual-hash (hash_size=16) Hamming distance <= this counts as a "
+                              "near-duplicate -- see dedup.py's find_duplicates docstring for how this "
+                              "default was empirically tuned. 0 disables near-duplicate detection "
+                              "(exact-hash dedup only).")
     args = parser.parse_args()
 
     records = []
