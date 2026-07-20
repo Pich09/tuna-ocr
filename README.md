@@ -34,7 +34,7 @@ tuna-ocr/
                      official letters) the data_gen templates are modeled on
 ```
 
-`recognizer/` trains **only** on `real_data`'s 5 configured Hugging Face
+`recognizer/` trains **only** on `real_data`'s 4 configured Hugging Face
 sources; `data_gen`'s synthetic output is a separate, independent
 data-generation track (for a YOLO layout detector / future recognizer
 training), not currently wired into `recognizer/`'s training pipeline.
@@ -131,7 +131,7 @@ for the full per-module breakdown and known gaps.
 ```bash
 pip install -r data_gen/requirements.txt -r real_data/requirements.txt -r recognizer/requirements.txt
 
-# pull real training data (5 configured sources, see real_data/config.py)
+# pull real training data (4 configured sources, printed text -- see real_data/config.py)
 python -m real_data.generate_external_chunks --source all --num-samples 500
 
 # fetch the shared tokenizer
@@ -142,7 +142,6 @@ python -m recognizer.train \
     --real-data-dirs real_data/samples/deepcopy_khmer_text_recognition \
                      real_data/samples/chanrith_ocr_image_line \
                      real_data/samples/darayut_scene_text \
-                     real_data/samples/soyvitou_handwritten \
                      real_data/samples/sokheng_synthetic_v1 \
     --tokenizer-dir recognizer/tokenizer/assets --run-name v1
 

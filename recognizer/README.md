@@ -66,7 +66,7 @@ wrapper (word segmentation + gazetteer/loanword masking) -- never a bare
 `KhmerOcrTokenizer` appends `<km>`/`<en>`/`<fr>` language tags and `<eob>`
 (end-of-block) past the base vocab; `<PAD>`/`<BOS>`/`<EOS>`/`<UNK>`/`<MASK>`
 are the base tokenizer's own reserved ids (looked up dynamically, never
-hardcoded). All 5 configured real_data sources are plain, untagged text, so
+hardcoded). All 4 configured real_data sources are plain, untagged text, so
 `encode_plain` (which tags the whole line via a cheap Khmer-vs-ASCII
 dominant-language guess) is the only encode path this pipeline exercises;
 `encode_tagged` (for data_gen-style inline `<km>...<en>...` spans) is
@@ -85,7 +85,6 @@ python -m recognizer.train \
     --real-data-dirs real_data/samples/deepcopy_khmer_text_recognition \
                      real_data/samples/chanrith_ocr_image_line \
                      real_data/samples/darayut_scene_text \
-                     real_data/samples/soyvitou_handwritten \
                      real_data/samples/sokheng_synthetic_v1 \
     --tokenizer-dir recognizer/tokenizer/assets --run-name v1
 ```

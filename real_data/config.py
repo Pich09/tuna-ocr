@@ -19,8 +19,13 @@ class ExternalChunkConfig:
 
 # External Hugging Face OCR datasets to sample from (see
 # real_data/hf_datasets.py). `image_col`/`text_col` of None means "run
-# column auto-detection" -- all 5 of these have undocumented/unconfirmed
+# column auto-detection" -- all 4 of these have undocumented/unconfirmed
 # schemas, so all rely on auto-detection rather than a trusted column name.
+#
+# SoyVitou/khmer-handwritten-dataset-4.2k was removed on purpose: it was the
+# only handwritten source in the mix, and training is focused on printed
+# text first -- add a dedicated handwritten-data pass back in later rather
+# than blending a single handwritten source in with printed ones now.
 EXTERNAL_DATASETS = {
     "deepcopy_khmer_text_recognition": {
         "hub_id": "deepcopy/khmer-text-recognition",
@@ -36,12 +41,6 @@ EXTERNAL_DATASETS = {
     },
     "darayut_scene_text": {
         "hub_id": "Darayut/khmer-scene-text-synthetic-contrast",
-        "split": "train",
-        "image_col": None,
-        "text_col": None,
-    },
-    "soyvitou_handwritten": {
-        "hub_id": "SoyVitou/khmer-handwritten-dataset-4.2k",
         "split": "train",
         "image_col": None,
         "text_col": None,

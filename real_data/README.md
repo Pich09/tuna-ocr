@@ -27,13 +27,16 @@ python -m real_data.generate_external_chunks --source all --num-samples 50
 
 ## External-source data + chunking
 
-Pulls a small streamed sample from five external Hugging Face OCR datasets
+Pulls a small streamed sample from four external Hugging Face OCR datasets
 (`config.EXTERNAL_DATASETS`: `deepcopy/khmer-text-recognition`,
 `Chanrith123333/khmer_english_ocr_image_line`,
-`Darayut/khmer-scene-text-synthetic-contrast`,
-`SoyVitou/khmer-handwritten-dataset-4.2k`, `Sokheng/khmer-synthetic-ocr-v1-100k`)
+`Darayut/khmer-scene-text-synthetic-contrast`, `Sokheng/khmer-synthetic-ocr-v1-100k`)
 and slices each line image into fixed-width overlapping chunks
-(`chunking.py`) for Conformer-encoder input windowing.
+(`chunking.py`) for Conformer-encoder input windowing. All four are printed
+text -- `SoyVitou/khmer-handwritten-dataset-4.2k` (the only handwritten
+source) was deliberately removed from the registry so training focuses on
+printed text first; add a dedicated handwritten pass back in later rather
+than blending a single handwritten source in with these.
 
 None of these datasets provide per-character/word boxes -- only one
 whole-line transcript per image -- so chunking does **not** re-derive
@@ -55,7 +58,7 @@ yielded -- can turn into minutes of wait even for a small buffer. Pass
 `--shuffle-buffer N` (N>0) if you have a fast connection and want less
 order-correlated sampling.
 
-All 5 sources' exact column names are undocumented (their HF dataset
+All 4 sources' exact column names are undocumented (their HF dataset
 viewers are broken or missing), so their `image_col`/`text_col` are `None`
 in `EXTERNAL_DATASETS` and get auto-detected at runtime (first `PIL.Image`
 column, first remaining `str` column); ambiguous detection raises rather

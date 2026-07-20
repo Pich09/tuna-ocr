@@ -5,7 +5,7 @@ recognizer/data/manifest.py -- data_gen synthetic output is out of scope).
 CLI:
     python -m recognizer.train --real-data-dirs real_data/samples/deepcopy_khmer_text_recognition \\
         real_data/samples/chanrith_ocr_image_line real_data/samples/darayut_scene_text \\
-        real_data/samples/soyvitou_handwritten real_data/samples/sokheng_synthetic_v1 \\
+        real_data/samples/sokheng_synthetic_v1 \\
         --tokenizer-dir recognizer/tokenizer/assets --run-name v1
 
 Runs on CPU, CUDA, or TPU -- the device is auto-detected (see env_utils.py)
