@@ -21,7 +21,7 @@ def infer(checkpoint_path: Path, image_path: Path, tokenizer_dir=TOKENIZER_ASSET
            max_len: int = 256, device=None):
     device = device or env_utils.get_torch_device()
     tokenizer = KhmerOcrTokenizer(tokenizer_dir)
-    model, model_cfg = load_model(checkpoint_path, tokenizer, device)
+    model, model_cfg, _char_vocab = load_model(checkpoint_path, tokenizer, device)
 
     chunk_tensors, _ = chunk_line_image(image_path, model_cfg.chunk_width, model_cfg.chunk_overlap, model_cfg.img_height)
     chunk_batch = torch.stack(chunk_tensors).to(device)

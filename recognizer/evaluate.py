@@ -17,6 +17,7 @@ from torch.utils.data import DataLoader
 
 from . import env_utils
 from .config import ModelConfig, TOKENIZER_ASSETS_DIR
+from .data.char_vocab import CharVocab
 from .data.dataset import OCRLineDataset, make_collate_fn
 from .data.manifest import build_combined_index
 from .modules.model import Recognizer
@@ -52,10 +53,15 @@ def load_model(checkpoint_path: Path, tokenizer: KhmerOcrTokenizer, device):
     # move it (works identically for cuda/cpu/xla).
     state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     model_cfg = state["model_cfg"]
-    model = Recognizer(model_cfg, tokenizer.vocab_size, bos_id=tokenizer.bos_id, pad_id=tokenizer.pad_id).to(device)
+    # Checkpoints from the character-CTC layout carry their own CTC label set;
+    # older subword-CTC checkpoints have none and fall back to vocab_size + 1.
+    char_vocab = CharVocab.from_json(state["char_vocab"]) if "char_vocab" in state else None
+    model = Recognizer(model_cfg, tokenizer.vocab_size, bos_id=tokenizer.bos_id,
+                       pad_id=tokenizer.pad_id,
+                       ctc_vocab_size=char_vocab.size if char_vocab else None).to(device)
     model.load_state_dict(state["model_state_dict"])
     model.eval()
-    return model, model_cfg
+    return model, model_cfg, char_vocab
 
 
 @torch.no_grad()
@@ -63,15 +69,15 @@ def evaluate(checkpoint_path: Path, real_data_roots, tokenizer_dir=TOKENIZER_ASS
              device=None):
     device = device or env_utils.get_torch_device()
     tokenizer = KhmerOcrTokenizer(tokenizer_dir)
-    model, model_cfg = load_model(checkpoint_path, tokenizer, device)
+    model, model_cfg, char_vocab = load_model(checkpoint_path, tokenizer, device)
 
     samples = build_combined_index(real_data_roots)
-    ds = OCRLineDataset(samples, tokenizer, model_cfg)
+    ds = OCRLineDataset(samples, tokenizer, model_cfg, char_vocab=char_vocab)
     collate_fn = make_collate_fn(tokenizer, model_cfg.chunk_width)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
 
     refs, ar_hyps, ctc_hyps = [], [], []
-    ctc_blank_id = tokenizer.vocab_size
+    ctc_blank_id = char_vocab.blank_id if char_vocab else tokenizer.vocab_size
     for batch in loader:
         batch = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
         enc_out, enc_lengths, enc_block_ids = model.encode(batch["chunks"], batch["chunks_per_line"])
@@ -83,7 +89,9 @@ def evaluate(checkpoint_path: Path, real_data_roots, tokenizer_dir=TOKENIZER_ASS
         for text, ar_row, ctc_row in zip(batch["texts"], ar_tokens.tolist(), ctc_tokens):
             refs.append(text)
             ar_hyps.append(tokenizer.decode(ar_row))
-            ctc_hyps.append(tokenizer.decode(ctc_row))
+            # CTC labels are characters when a char vocab is present -- decoding
+            # them through the subword tokenizer would be meaningless.
+            ctc_hyps.append(char_vocab.decode(ctc_row) if char_vocab else tokenizer.decode(ctc_row))
 
     ar_cer = compute_cer(refs, ar_hyps)
     ctc_cer = compute_cer(refs, ctc_hyps)

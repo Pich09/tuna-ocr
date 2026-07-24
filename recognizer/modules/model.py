@@ -7,12 +7,18 @@ from .encoder import ConformerEncoder
 
 
 class Recognizer(nn.Module):
-    def __init__(self, cfg, vocab_size: int, bos_id: int, pad_id: int):
+    def __init__(self, cfg, vocab_size: int, bos_id: int, pad_id: int, ctc_vocab_size: int = None):
         super().__init__()
         self.encoder = ConformerEncoder(cfg)
-        # +1 for the CTC blank symbol -- distinct from the decoder's <eob>
-        # end-of-block control token; never conflate the two.
-        self.ctc_head = nn.Linear(cfg.d_model, vocab_size + 1)
+        # `ctc_vocab_size` is the CTC head's OWN label-set size (blank
+        # included). It is deliberately decoupled from the decoder's subword
+        # vocab: CTC uses a small character label set so the encoder can
+        # actually learn glyph->label mappings, while the decoder keeps the
+        # shared subword tokenizer (see data/char_vocab.py). When omitted,
+        # falls back to the legacy subword-CTC layout (vocab_size + 1 for
+        # blank) so older checkpoints still load.
+        self.ctc_vocab_size = ctc_vocab_size if ctc_vocab_size is not None else vocab_size + 1
+        self.ctc_head = nn.Linear(cfg.d_model, self.ctc_vocab_size)
         self.decoder = BlockwiseARDecoder(cfg, vocab_size, bos_id, pad_id)
 
     def forward(self, chunk_batch, chunks_per_line, ar_targets):

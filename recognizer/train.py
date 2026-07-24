@@ -30,6 +30,7 @@ import argparse
 import csv
 import logging
 import math
+import random
 import time
 from pathlib import Path
 
@@ -39,8 +40,10 @@ from torch.utils.data import DataLoader
 
 from . import env_utils
 from .config import ModelConfig, TrainConfig, DEFAULT_CHECKPOINT_ROOT, TOKENIZER_ASSETS_DIR
-from .data.dataset import BucketBatchSampler, OCRLineDataset, make_collate_fn
+from .data.char_vocab import CharVocab, build_char_vocab
+from .data.dataset import BucketBatchSampler, OCRLineDataset, compute_widths, make_collate_fn
 from .data.manifest import build_combined_index, load_dedup_manifest
+from .data.transforms import chunk_line_image
 from .hf_push import push_checkpoint
 from .modules.model import Recognizer
 from .tokenizer.khmer_ocr_tokenizer import KhmerOcrTokenizer
@@ -68,21 +71,46 @@ def build_logger(ckpt_dir: Path, run_name: str) -> logging.Logger:
     return logger
 
 
-def find_max_batch_size(model, dataset, collate_fn, device, start: int = 64, min_batch: int = 1) -> int:
+def find_max_batch_size(model, dataset, collate_fn, device, widths, start: int = 64, min_batch: int = 1) -> int:
     """OOM-probing auto-tune: try `start`, halve on CUDA OOM until a batch
     fits (forward + backward). CPU/TPU just use the configured default --
     on TPU, memory errors don't surface as a catchable Python OOM the same
-    way (XLA compiles lazily), so this probe isn't meaningful there."""
+    way (XLA compiles lazily), so this probe isn't meaningful there.
+
+    Probes against the `bs` WIDEST samples in the dataset (by `widths`, one
+    entry per dataset index), not arbitrary ones: BucketBatchSampler groups
+    similar-width images into the same batch, so the batch of widest images
+    has the largest memory footprint of any batch actually seen during
+    training. Probing with arbitrary samples can under-estimate that peak
+    and pass, only to OOM later mid-training once the width-sorted order
+    reaches its widest batch -- losing all progress since the last
+    checkpoint (observed in practice: a probe at bs=64 against non-worst-case
+    samples passed, then training OOM'd ~5300 steps in on the real widest
+    batch).
+
+    Also reserves (and immediately frees) a dummy allocation matching
+    AdamW's exp_avg + exp_avg_sq per-parameter state: that state is only
+    allocated lazily on the optimizer's first real step(), which happens
+    after this probe and outside it, so a plain forward+backward here would
+    otherwise under-count real training's steady-state memory by roughly
+    2x the model's parameter footprint. A dummy tensor (not a real
+    optimizer.step()) verifies the room exists without nudging the model's
+    actual initialization with a bogus gradient from this probe's fake
+    (sum-of-logits) objective."""
     if device.type != "cuda":
         return start
+    widest_idx = sorted(range(len(widths)), key=lambda i: widths[i], reverse=True)
+    optim_state_bytes = sum(p.numel() for p in model.parameters()) * 2 * 4  # fp32 exp_avg + exp_avg_sq
     bs = start
     while bs >= min_batch:
         try:
-            idxs = [i % len(dataset) for i in range(bs)]
+            idxs = widest_idx[:bs]
             batch = collate_fn([dataset[i] for i in idxs])
             batch = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
             ctc_logits, ar_logits, _ = model(batch["chunks"], batch["chunks_per_line"], batch["ar_targets"])
             (ctc_logits.float().sum() + ar_logits.float().sum()).backward()
+            optim_reserve = torch.empty(optim_state_bytes, dtype=torch.uint8, device=device)
+            del optim_reserve
             model.zero_grad(set_to_none=True)
             del ctc_logits, ar_logits
             torch.cuda.empty_cache()
@@ -94,17 +122,26 @@ def find_max_batch_size(model, dataset, collate_fn, device, start: int = 64, min
     return max(min_batch, 1)
 
 
-def lr_lambda(step: int, warmup_steps: int, max_steps: int) -> float:
+def lr_lambda(step: int, warmup_steps: int, max_steps: int, min_lr_ratio: float = 0.0) -> float:
     if step < warmup_steps:
-        return step / max(1, warmup_steps)
+        linear = step / max(1, warmup_steps)
+        return min_lr_ratio + (1 - min_lr_ratio) * linear
     progress = (step - warmup_steps) / max(1, max_steps - warmup_steps)
-    return 0.5 * (1 + math.cos(math.pi * min(1.0, progress)))
+    cosine = 0.5 * (1 + math.cos(math.pi * min(1.0, progress)))
+    return min_lr_ratio + (1 - min_lr_ratio) * cosine
 
 
-def compute_loss(ctc_logits, ar_logits, batch, ctc_weight: float, pad_id: int, ctc_blank_id: int):
+def compute_loss(ctc_logits, ar_logits, batch, ctc_weight: float, pad_id: int, ctc_blank_id: int,
+                 enc_lengths=None):
     b, t_max, _ = ctc_logits.shape
     log_probs = F.log_softmax(ctc_logits, dim=-1).transpose(0, 1)  # (T,N,C)
-    ctc_input_lengths = torch.full((b,), t_max, dtype=torch.long, device=ctc_logits.device)
+    # Real per-sample encoder lengths, not t_max: enc_out is zero-padded up to
+    # the batch's longest line, and claiming those padding frames are real
+    # input makes CTC align targets against blank padding.
+    if enc_lengths is not None:
+        ctc_input_lengths = enc_lengths.to(dtype=torch.long, device=ctc_logits.device)
+    else:
+        ctc_input_lengths = torch.full((b,), t_max, dtype=torch.long, device=ctc_logits.device)
     # CTCLoss expects the blank id to match the logits' extra class; ctc_head
     # appends it at index vocab_size, so remap that here explicitly.
     ctc_loss = F.ctc_loss(
@@ -117,6 +154,42 @@ def compute_loss(ctc_logits, ar_logits, batch, ctc_weight: float, pad_id: int, c
     )
     loss = ctc_weight * ctc_loss + (1 - ctc_weight) * ce_loss
     return loss, ctc_loss, ce_loss
+
+
+@torch.no_grad()
+def log_inference_samples(model, tokenizer, model_cfg, samples, device, logger, step, char_vocab=None):
+    """Greedy-decodes a handful of fixed held-out samples and logs
+    prediction vs ground truth -- a cheap, human-readable sanity check that
+    the model is actually learning to read (not just that the loss number
+    is dropping), run periodically alongside the numeric metrics."""
+    was_training = model.training
+    model.eval()
+    for i, sample in enumerate(samples):
+        chunk_tensors, _ = chunk_line_image(
+            sample.image_path, model_cfg.chunk_width, model_cfg.chunk_overlap, model_cfg.img_height,
+        )
+        chunk_batch = torch.stack(chunk_tensors).to(device)
+        chunks_per_line = torch.tensor([len(chunk_tensors)], dtype=torch.long, device=device)
+        enc_out, enc_lengths, enc_block_ids = model.encode(chunk_batch, chunks_per_line)
+        max_blocks = min(len(chunk_tensors), 256 // max(1, model_cfg.max_tokens_per_block) + 1)
+        tokens = model.decoder.decode_greedy(enc_out, enc_lengths, enc_block_ids, max_blocks)[0].tolist()
+        pred = tokenizer.decode(tokens, strip_control=True)
+        # CTC greedy is the encoder's own read-out: it is alignment-free and
+        # not exposed to the decoder's exposure bias, so it is the earliest
+        # honest signal that the encoder is learning to SEE text at all.
+        ctc_txt = ""
+        if char_vocab is not None:
+            ctc_ids = model.ctc_head(enc_out).argmax(-1)[0]
+            seq, prev = [], -1
+            for t in range(int(enc_lengths[0])):
+                c = int(ctc_ids[t])
+                if c != prev and c != char_vocab.blank_id:
+                    seq.append(c)
+                prev = c
+            ctc_txt = char_vocab.decode(seq)
+        logger.info(f"  [sample {i}] step {step} gt={sample.text!r} ctc={ctc_txt!r} ar={pred!r}")
+    if was_training:
+        model.train()
 
 
 def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots=None, dedup_manifest_path=None,
@@ -144,35 +217,73 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
         raise RuntimeError(f"No samples found (dedup_manifest_path={dedup_manifest_path}, "
                             f"real_data_roots={real_data_roots}) -- generate/deduplicate data first with "
                             f"`python -m real_data.generate_external_chunks` and `python -m real_data.deduplicate`.")
+    # Shuffle before splitting: the pooled manifest is written source-by-
+    # source, so a head slice would make the whole val set (and every sampled
+    # prediction) come from one source only.
+    samples = list(samples)
+    random.Random(train_cfg.seed).shuffle(samples)
     n_val = max(1, int(len(samples) * train_cfg.val_frac))
     train_samples, val_samples = samples[n_val:], samples[:n_val]
+    # fixed subset (not re-sampled) so the same lines are tracked across the
+    # whole run -- otherwise a changing sample set would confound "is this
+    # getting more readable" with "is this a different, easier/harder line".
+    inference_samples = val_samples[:train_cfg.num_samples]
 
-    train_ds = OCRLineDataset(train_samples, tokenizer, model_cfg)
+    ckpt_dir_early = Path(checkpoint_root) / run_name
+    ckpt_dir_early.mkdir(parents=True, exist_ok=True)
+    char_vocab_path = ckpt_dir_early / "char_vocab.json"
+    if char_vocab_path.exists():
+        char_vocab = CharVocab.load(char_vocab_path)
+    else:
+        char_vocab = build_char_vocab((s.text for s in train_samples), min_count=2)
+        char_vocab.save(char_vocab_path)
+
+    train_ds = OCRLineDataset(train_samples, tokenizer, model_cfg, char_vocab=char_vocab)
     collate_fn = make_collate_fn(tokenizer, model_cfg.chunk_width)
 
-    model = Recognizer(model_cfg, tokenizer.vocab_size, bos_id=tokenizer.bos_id, pad_id=tokenizer.pad_id).to(device)
+    model = Recognizer(model_cfg, tokenizer.vocab_size, bos_id=tokenizer.bos_id,
+                       pad_id=tokenizer.pad_id, ctc_vocab_size=char_vocab.size).to(device)
 
-    ckpt_dir = Path(checkpoint_root) / run_name
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_dir = ckpt_dir_early
     logger = build_logger(ckpt_dir, run_name)
     logger.info(f"run '{run_name}': device={device}, {len(train_samples)} train / {len(val_samples)} val samples, "
                 f"checkpoints -> {ckpt_dir}, log file -> {ckpt_dir / 'train.log'}")
 
+    # Shared by the OOM probe (worst-case batch) and the bucket sampler.
+    # Cached next to the data it describes, so the multi-minute width scan is
+    # paid once per dataset rather than on every restart.
+    widths_cache = (Path(dedup_manifest_path).parent / "widths_cache.json"
+                    if dedup_manifest_path else ckpt_dir / "widths_cache.json")
+    t_w = time.time()
+    widths = compute_widths(train_ds, cache_path=widths_cache)
+    logger.info(f"image widths ready in {time.time() - t_w:.1f}s (cache: {widths_cache})")
+
     batch_size = train_cfg.batch_size
     if auto_batch_size:
-        batch_size = find_max_batch_size(model, train_ds, collate_fn, device, start=max(64, train_cfg.batch_size))
+        batch_size = find_max_batch_size(model, train_ds, collate_fn, device, widths, start=max(64, train_cfg.batch_size))
         logger.info(f"auto batch size: {batch_size}")
 
     steps_per_epoch = max(1, len(train_ds) // batch_size)
     logger.info(f"batch_size={batch_size}, ~{steps_per_epoch} steps/epoch, max_steps={train_cfg.max_steps} "
                 f"(~{train_cfg.max_steps / steps_per_epoch:.1f} epochs)")
 
-    sampler = BucketBatchSampler(train_ds, batch_size=batch_size, shuffle=True)
-    loader = DataLoader(train_ds, batch_sampler=sampler, collate_fn=collate_fn)
+    sampler = BucketBatchSampler(train_ds, batch_size=batch_size, shuffle=True, widths=widths)
+    # num_workers>0 so image loading/decoding for the *next* batch overlaps
+    # with the GPU forward/backward of the *current* one -- without this the
+    # DataLoader runs synchronously on the main process and the GPU sits
+    # idle between steps waiting on CPU-bound JPEG decode, which is exactly
+    # the "GPU not fully utilized" symptom this was tuned to fix.
+    loader = DataLoader(
+        train_ds, batch_sampler=sampler, collate_fn=collate_fn,
+        num_workers=train_cfg.num_workers, pin_memory=(device.type == "cuda"),
+        persistent_workers=train_cfg.num_workers > 0,
+        prefetch_factor=4 if train_cfg.num_workers > 0 else None,
+    )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=train_cfg.lr)
+    min_lr_ratio = train_cfg.min_lr / train_cfg.lr
     scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, lambda step: lr_lambda(step, train_cfg.warmup_steps, train_cfg.max_steps),
+        optimizer, lambda step: lr_lambda(step, train_cfg.warmup_steps, train_cfg.max_steps, min_lr_ratio),
     )
 
     log_path = ckpt_dir / "train_log.csv"
@@ -195,7 +306,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
         logger.info(f"resumed from {resume_path} at step {step} "
                     f"({train_cfg.max_steps - step} steps remaining to max_steps={train_cfg.max_steps})")
 
-    ctc_blank_id = tokenizer.vocab_size
+    ctc_blank_id = char_vocab.blank_id
     model.train()
     t0 = time.time()
     while step < train_cfg.max_steps:
@@ -203,9 +314,11 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
             if step >= train_cfg.max_steps:
                 break
             batch = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
-            ctc_logits, ar_logits, _ = model(batch["chunks"], batch["chunks_per_line"], batch["ar_targets"])
+            ctc_logits, ar_logits, enc_lengths = model(
+                batch["chunks"], batch["chunks_per_line"], batch["ar_targets"])
             loss, ctc_loss, ce_loss = compute_loss(
                 ctc_logits, ar_logits, batch, train_cfg.ctc_weight, tokenizer.pad_id, ctc_blank_id,
+                enc_lengths=enc_lengths,
             )
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -225,12 +338,17 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
                 with log_path.open("a", newline="") as f:
                     csv.writer(f).writerow([step, f"{epoch:.4f}", loss.item(), ctc_loss.item(), ce_loss.item(), lr])
 
+            if train_cfg.sample_every > 0 and step % train_cfg.sample_every == 0 and inference_samples:
+                log_inference_samples(model, tokenizer, model_cfg, inference_samples, device, logger, step,
+                                      char_vocab=char_vocab)
+
             if step % train_cfg.ckpt_every == 0:
                 ckpt_path = ckpt_dir / f"step_{step:07d}.pt"
                 state = {
                     "step": step, "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "scheduler_state_dict": scheduler.state_dict(), "model_cfg": model_cfg,
+                    "char_vocab": char_vocab.to_json(),
                 }
                 save_fn = xm.save if is_xla else torch.save  # xm.save moves XLA tensors to CPU before writing
                 save_fn(state, ckpt_path)
@@ -263,6 +381,13 @@ def main():
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--log-every", type=int, default=None)
     parser.add_argument("--ckpt-every", type=int, default=None)
+    parser.add_argument("--sample-every", type=int, default=None,
+                         help="Greedy-decode a few fixed held-out samples every N steps and log pred vs "
+                              "ground truth, as a readability sanity check alongside the loss numbers. "
+                              "0 disables.")
+    parser.add_argument("--num-workers", type=int, default=None,
+                         help="DataLoader worker processes for image loading/decoding. 0 = synchronous "
+                              "(main process only) -- keep >0 to avoid GPU idling on CPU-bound decode.")
     parser.add_argument("--push-to-hub", action="store_true")
     parser.add_argument("--hub-public", action="store_true",
                          help="Make the pushed HF checkpoint repo public (default: private).")
@@ -281,6 +406,10 @@ def main():
         train_cfg.log_every = args.log_every
     if args.ckpt_every:
         train_cfg.ckpt_every = args.ckpt_every
+    if args.sample_every is not None:
+        train_cfg.sample_every = args.sample_every
+    if args.num_workers is not None:
+        train_cfg.num_workers = args.num_workers
 
     run_training(
         model_cfg, train_cfg, real_data_roots=args.real_data_dirs, dedup_manifest_path=args.dedup_manifest,

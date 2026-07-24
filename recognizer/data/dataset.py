@@ -5,7 +5,10 @@ the plan's Step 0.5/Step 3. Since no source provides real per-token
 alignment, each sample's tagged token sequence is uniform-split into
 `num_chunks` runs for teacher forcing (Step 3's documented approximation).
 """
+import json
 import warnings
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import torch
 from torch.utils.data import Dataset, Sampler
@@ -41,10 +44,14 @@ def split_into_blocks(token_ids: list, num_blocks: int, max_tokens_per_block: in
 
 
 class OCRLineDataset(Dataset):
-    def __init__(self, samples: list, tokenizer, cfg):
+    def __init__(self, samples: list, tokenizer, cfg, char_vocab=None):
         self.samples = samples
         self.tokenizer = tokenizer
         self.cfg = cfg
+        # When set, the CTC target is character ids instead of subword ids --
+        # see data/char_vocab.py for the measurement that motivated this.
+        # The AR target always stays subword.
+        self.char_vocab = char_vocab
 
     def __len__(self):
         return len(self.samples)
@@ -66,10 +73,11 @@ class OCRLineDataset(Dataset):
             token_ids, len(chunk_tensors), self.cfg.max_tokens_per_block,
             self.tokenizer.eob_id, self.tokenizer.pad_id, source=sample.source,
         )
+        ctc_ids = self.char_vocab.encode(sample.text) if self.char_vocab else token_ids
         return {
             "chunks": chunk_tensors,
             "valid_widths": valid_widths,
-            "ctc_target": torch.tensor(token_ids, dtype=torch.long),
+            "ctc_target": torch.tensor(ctc_ids, dtype=torch.long),
             "ar_target": torch.tensor(ar_rows, dtype=torch.long),
             "text": sample.text,
         }
@@ -109,19 +117,67 @@ def make_collate_fn(tokenizer, chunk_width: int):
     return collate_fn
 
 
+def compute_widths(dataset: "OCRLineDataset", num_workers: int = 32, cache_path: Path = None) -> list:
+    """Per-sample image width, threaded (I/O-bound: PIL's lazy header read
+    releases the GIL during the actual file read) -- at millions of samples
+    a serial scan is minutes of dead time. Shared by BucketBatchSampler (to
+    bucket similar-width images together) and find_max_batch_size (to probe
+    OOM safety against the actual widest -- i.e. worst-case memory -- batch,
+    not an arbitrary one: since batches are width-bucketed, the batch of
+    widest images is exactly the one most likely to OOM mid-training if the
+    probe under-estimated it).
+
+    Even threaded, this is one stat/header-read per sample and is bound by
+    the filesystem, not the CPU -- ~25 min for a 4M-sample corpus on a busy
+    disk, paid before the first training step on EVERY (re)start. The result
+    is a pure function of the sample list, so `cache_path` memoizes it to
+    disk: subsequent runs over the same data load it in seconds. The cache
+    is keyed on the sample list's identity (length + first/last path), so a
+    changed dataset misses the cache and recomputes rather than silently
+    reusing stale widths."""
+    key = None
+    if cache_path is not None and len(dataset) > 0:
+        key = (f"{len(dataset)}|{dataset.samples[0].image_path}|"
+               f"{dataset.samples[-1].image_path}")
+        try:
+            with open(cache_path, encoding="utf-8") as f:
+                blob = json.load(f)
+            if blob.get("key") == key and len(blob.get("widths", ())) == len(dataset):
+                return blob["widths"]
+        except (OSError, ValueError):
+            pass  # missing/corrupt cache -> just recompute
+
+    with ThreadPoolExecutor(max_workers=num_workers) as pool:
+        widths = list(pool.map(dataset.image_width, range(len(dataset))))
+
+    if key is not None:
+        try:
+            cache_path = Path(cache_path)
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = cache_path.with_name(cache_path.name + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"key": key, "widths": widths}, f)
+            tmp.replace(cache_path)  # atomic: never leave a half-written cache
+        except OSError:
+            pass  # caching is an optimization; never fail training over it
+    return widths
+
+
 class BucketBatchSampler(Sampler):
     """Sorts indices once by (cheap-to-read) image width so each batch has
     similar chunk counts, minimizing pad waste, then shuffles BATCH order
     (not sample order) each epoch."""
 
-    def __init__(self, dataset: OCRLineDataset, batch_size: int, shuffle: bool = True, generator=None):
+    def __init__(self, dataset: OCRLineDataset, batch_size: int, shuffle: bool = True, generator=None,
+                 widths: list = None):
         self.dataset = dataset
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.generator = generator
-        widths = [(i, dataset.image_width(i)) for i in range(len(dataset))]
-        widths.sort(key=lambda p: p[1])
-        sorted_idx = [i for i, _ in widths]
+        if widths is None:
+            widths = compute_widths(dataset)
+        indexed = sorted(enumerate(widths), key=lambda p: p[1])
+        sorted_idx = [i for i, _ in indexed]
         self.batches = [sorted_idx[i : i + batch_size] for i in range(0, len(sorted_idx), batch_size)]
 
     def __iter__(self):

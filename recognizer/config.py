@@ -34,11 +34,15 @@ class ModelConfig:
 @dataclass
 class TrainConfig:
     batch_size: int = 32
-    lr: float = 3e-4
+    lr: float = 5e-4
+    min_lr: float = 1e-6
     warmup_steps: int = 4000
     max_steps: int = 200_000
     ctc_weight: float = 0.3
     val_frac: float = 0.02
     log_every: int = 100
     ckpt_every: int = 10_000
+    sample_every: int = 500
+    num_samples: int = 3
+    num_workers: int = 8
     seed: int = 0
