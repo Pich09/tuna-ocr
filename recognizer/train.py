@@ -192,6 +192,47 @@ def log_inference_samples(model, tokenizer, model_cfg, samples, device, logger, 
         model.train()
 
 
+def evaluate_val_cer(model, tokenizer, model_cfg, val_samples, device, char_vocab):
+    """Greedy-decodes the whole held-out val set and returns (ar_cer, ctc_cer)
+    -- a real quantitative performance number to track alongside the loss
+    (loss can keep falling on train while val CER climbs; that gap is the
+    overfitting signal). AR CER is the decoder's read-out, CTC CER the
+    encoder's alignment-free read-out. Runs in eval mode, restores train
+    mode on exit; no grad."""
+    import editdistance  # noqa: PLC0415 -- kept local so training without eval has no hard dep
+
+    def cer(refs, hyps):
+        edits = sum(editdistance.eval(r, h) for r, h in zip(refs, hyps))
+        return edits / (sum(len(r) for r in refs) or 1)
+
+    was_training = model.training
+    model.eval()
+    ar_refs, ar_hyps, ctc_hyps = [], [], []
+    with torch.no_grad():
+        for sample in val_samples:
+            chunk_tensors, _ = chunk_line_image(
+                sample.image_path, model_cfg.chunk_width, model_cfg.chunk_overlap, model_cfg.img_height,
+            )
+            chunk_batch = torch.stack(chunk_tensors).to(device)
+            chunks_per_line = torch.tensor([len(chunk_tensors)], dtype=torch.long, device=device)
+            enc_out, enc_lengths, enc_block_ids = model.encode(chunk_batch, chunks_per_line)
+            max_blocks = min(len(chunk_tensors), 256 // max(1, model_cfg.max_tokens_per_block) + 1)
+            tokens = model.decoder.decode_greedy(enc_out, enc_lengths, enc_block_ids, max_blocks)[0].tolist()
+            ar_refs.append(sample.text)
+            ar_hyps.append(tokenizer.decode(tokens, strip_control=True))
+            ctc_ids = model.ctc_head(enc_out).argmax(-1)[0]
+            seq, prev = [], -1
+            for t in range(int(enc_lengths[0])):
+                c = int(ctc_ids[t])
+                if c != prev and c != char_vocab.blank_id:
+                    seq.append(c)
+                prev = c
+            ctc_hyps.append(char_vocab.decode(seq))
+    if was_training:
+        model.train()
+    return cer(ar_refs, ar_hyps), cer(ar_refs, ctc_hyps)
+
+
 def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots=None, dedup_manifest_path=None,
                   tokenizer_dir=TOKENIZER_ASSETS_DIR, checkpoint_root=DEFAULT_CHECKPOINT_ROOT, run_name: str = "v1",
                   push_to_hub: bool = False, repo_id=None, hf_token=None, hub_private: bool = True,
@@ -268,6 +309,21 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
                 f"(~{train_cfg.max_steps / steps_per_epoch:.1f} epochs)")
 
     sampler = BucketBatchSampler(train_ds, batch_size=batch_size, shuffle=True, widths=widths)
+    # DataLoader workers must use the "fork" start method: the dataset holds a
+    # KhmerOcrTokenizer whose `_base` is a *dynamically imported*
+    # khmer_segmentation.KhmerTokenizer (loaded from tokenizer assets, not an
+    # importable module), which is unpicklable. Python 3.14 defaults to the
+    # "forkserver"/"spawn" start method on Linux, which pickles the dataset to
+    # hand it to each worker -> PicklingError before step 1. "fork" instead
+    # inherits parent memory, so nothing is pickled. Workers only do CPU-bound
+    # image decode (never touch CUDA), so forking after CUDA init in the parent
+    # is safe here.
+    if train_cfg.num_workers > 0:
+        import multiprocessing as mp  # noqa: PLC0415
+        try:
+            mp.set_start_method("fork", force=True)
+        except RuntimeError:
+            pass
     # num_workers>0 so image loading/decoding for the *next* batch overlaps
     # with the GPU forward/backward of the *current* one -- without this the
     # DataLoader runs synchronously on the main process and the GPU sits
@@ -289,6 +345,10 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
     log_path = ckpt_dir / "train_log.csv"
     if not log_path.exists():
         log_path.write_text("step,epoch,loss,ctc_loss,ce_loss,lr\n")
+
+    eval_log_path = ckpt_dir / "eval_log.csv"
+    if not eval_log_path.exists():
+        eval_log_path.write_text("step,epoch,val_ar_cer,val_ctc_cer\n")
 
     step = 0
     if resume_path:
@@ -342,6 +402,15 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
                 log_inference_samples(model, tokenizer, model_cfg, inference_samples, device, logger, step,
                                       char_vocab=char_vocab)
 
+            if train_cfg.eval_every > 0 and step % train_cfg.eval_every == 0 and val_samples:
+                ar_cer, ctc_cer = evaluate_val_cer(
+                    model, tokenizer, model_cfg, val_samples, device, char_vocab)
+                epoch = step / steps_per_epoch
+                logger.info(f"eval step {step} epoch {epoch:.2f} val_ar_cer {ar_cer:.4f} "
+                            f"val_ctc_cer {ctc_cer:.4f} (n={len(val_samples)})")
+                with eval_log_path.open("a", newline="") as f:
+                    csv.writer(f).writerow([step, f"{epoch:.4f}", f"{ar_cer:.4f}", f"{ctc_cer:.4f}"])
+
             if step % train_cfg.ckpt_every == 0:
                 ckpt_path = ckpt_dir / f"step_{step:07d}.pt"
                 state = {
@@ -385,6 +454,9 @@ def main():
                          help="Greedy-decode a few fixed held-out samples every N steps and log pred vs "
                               "ground truth, as a readability sanity check alongside the loss numbers. "
                               "0 disables.")
+    parser.add_argument("--eval-every", type=int, default=None,
+                         help="Compute quantitative held-out val CER (AR + CTC) over the whole val set "
+                              "every N steps, logged to train.log and eval_log.csv. 0 disables.")
     parser.add_argument("--num-workers", type=int, default=None,
                          help="DataLoader worker processes for image loading/decoding. 0 = synchronous "
                               "(main process only) -- keep >0 to avoid GPU idling on CPU-bound decode.")
@@ -408,6 +480,8 @@ def main():
         train_cfg.ckpt_every = args.ckpt_every
     if args.sample_every is not None:
         train_cfg.sample_every = args.sample_every
+    if args.eval_every is not None:
+        train_cfg.eval_every = args.eval_every
     if args.num_workers is not None:
         train_cfg.num_workers = args.num_workers
 

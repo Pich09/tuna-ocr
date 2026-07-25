@@ -43,6 +43,7 @@ class TrainConfig:
     log_every: int = 100
     ckpt_every: int = 10_000
     sample_every: int = 500
+    eval_every: int = 500  # full held-out val CER (AR + CTC) every N steps; 0 disables
     num_samples: int = 3
     num_workers: int = 8
     seed: int = 0
