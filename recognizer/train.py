@@ -308,6 +308,20 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
     logger.info(f"batch_size={batch_size}, ~{steps_per_epoch} steps/epoch, max_steps={train_cfg.max_steps} "
                 f"(~{train_cfg.max_steps / steps_per_epoch:.1f} epochs)")
 
+    # Guard against warmup >= max_steps: the LR schedule is linear-warmup then
+    # cosine-decay, so if warmup_steps >= max_steps the run *never leaves
+    # warmup* -- LR ramps but never reaches peak and never decays, so learning
+    # crawls the whole run (this is exactly what stalled CTC in an earlier run:
+    # warmup_steps=4000 default paired with an overridden max_steps=3000 left LR
+    # at ~8% of peak through the phase where CTC should learn to spike, so it
+    # sat at all-blank). Clamp to 10% of max_steps and log loudly rather than
+    # silently crippling the run.
+    if train_cfg.warmup_steps >= train_cfg.max_steps:
+        clamped = max(1, int(0.1 * train_cfg.max_steps))
+        logger.info(f"WARNING: warmup_steps={train_cfg.warmup_steps} >= max_steps={train_cfg.max_steps} "
+                    f"-> LR would never reach peak; clamping warmup_steps to {clamped} (10% of max_steps).")
+        train_cfg.warmup_steps = clamped
+
     sampler = BucketBatchSampler(train_ds, batch_size=batch_size, shuffle=True, widths=widths)
     # DataLoader workers must use the "fork" start method: the dataset holds a
     # KhmerOcrTokenizer whose `_base` is a *dynamically imported*
@@ -448,6 +462,10 @@ def main():
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--auto-batch-size", action="store_true")
     parser.add_argument("--max-steps", type=int, default=None)
+    parser.add_argument("--warmup-steps", type=int, default=None,
+                         help="Linear LR warmup steps before cosine decay. Keep well below max_steps "
+                              "(~10 percent) -- if >= max_steps the run never reaches peak LR "
+                              "(auto-clamped with a warning). The config default assumes the long max_steps.")
     parser.add_argument("--log-every", type=int, default=None)
     parser.add_argument("--ckpt-every", type=int, default=None)
     parser.add_argument("--sample-every", type=int, default=None,
@@ -474,6 +492,8 @@ def main():
         train_cfg.batch_size = args.batch_size
     if args.max_steps:
         train_cfg.max_steps = args.max_steps
+    if args.warmup_steps is not None:
+        train_cfg.warmup_steps = args.warmup_steps
     if args.log_every:
         train_cfg.log_every = args.log_every
     if args.ckpt_every:
