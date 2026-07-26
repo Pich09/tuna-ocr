@@ -12,9 +12,8 @@ from pathlib import Path
 
 import torch
 from torch.utils.data import Dataset, Sampler
-from PIL import Image
 
-from .transforms import chunk_line_image
+from .transforms import chunk_line_image, open_image
 
 
 def split_into_blocks(token_ids: list, num_blocks: int, max_tokens_per_block: int, eob_id: int, pad_id: int, source: str = "") -> list:
@@ -60,13 +59,13 @@ class OCRLineDataset(Dataset):
         """Cheap width lookup (PIL lazy header read, no full pixel decode)
         used by BucketBatchSampler -- proxy for num_chunks without paying
         for the actual chunking pass."""
-        with Image.open(self.samples[idx].image_path) as img:
+        with open_image(self.samples[idx].image_source) as img:
             return img.size[0]
 
     def __getitem__(self, idx):
         sample = self.samples[idx]
         chunk_tensors, valid_widths = chunk_line_image(
-            sample.image_path, self.cfg.chunk_width, self.cfg.chunk_overlap, self.cfg.img_height,
+            sample.image_source, self.cfg.chunk_width, self.cfg.chunk_overlap, self.cfg.img_height,
         )
         token_ids = self.tokenizer.encode_plain(sample.text)
         ar_rows = split_into_blocks(
@@ -135,10 +134,19 @@ def compute_widths(dataset: "OCRLineDataset", num_workers: int = 32, cache_path:
     is keyed on the sample list's identity (length + first/last path), so a
     changed dataset misses the cache and recomputes rather than silently
     reusing stale widths."""
+    def _sample_key(s):
+        # image_path gives a stable identity for path-backed samples; bytes-backed
+        # samples (Arrow-packed, see manifest.py) have no path, so fall back to a
+        # cheap (not cryptographic) proxy -- byte length + text -- good enough to
+        # invalidate the cache on a genuinely different dataset.
+        if s.image_path is not None:
+            return str(s.image_path)
+        return f"bytes:{len(s.image_bytes)}:{s.text}"
+
     key = None
     if cache_path is not None and len(dataset) > 0:
-        key = (f"{len(dataset)}|{dataset.samples[0].image_path}|"
-               f"{dataset.samples[-1].image_path}")
+        key = (f"{len(dataset)}|{_sample_key(dataset.samples[0])}|"
+               f"{_sample_key(dataset.samples[-1])}")
         try:
             with open(cache_path, encoding="utf-8") as f:
                 blob = json.load(f)

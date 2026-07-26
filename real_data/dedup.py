@@ -1,6 +1,6 @@
 """Duplicate detection for pulled real_data line images -- pure functions,
 no CLI/manifest-format knowledge here (see deduplicate.py for the CLI that
-reads/writes manifests). Operates on whole-line images (the training unit
+reads/writes Arrow files). Operates on whole-line images (the training unit
 recognizer/ actually consumes, per its is_full_line-only manifest loader),
 not the pre-cut chunk crops.
 
@@ -8,7 +8,7 @@ Two kinds of duplication are detected, and only one is auto-removed:
 - **Exact image duplicates** (byte-identical files, e.g. the same line
   photographed/rendered twice, or the same row appearing under two source
   names -- this was the concern that motivated this pipeline, see
-  real_data/README.md): detected via SHA-256 of the raw file bytes, cheap
+  real_data/README.md): detected via SHA-256 of the raw image bytes, cheap
   and unambiguous. Always removed (kept: first occurrence, by input order).
 - **Near-duplicate images** (perceptually near-identical but not
   byte-identical -- e.g. a re-encoded/re-compressed copy): detected via
@@ -23,22 +23,22 @@ worth reporting, not a redundancy worth deleting. See DedupResult.
 duplicate_text_count.
 
 Near-duplicate detection is brute-force O(n^2) pairwise Hamming distance
-over survivors of the exact-dedup pass -- fine at the scale these pulls
-operate at (hundreds to a few thousand samples per source), not something
-that would scale to a full multi-million-row dataset pull without an
-LSH/BK-tree index -- noted as a known limitation, not implemented here
-since it's not needed at current pull sizes.
+over survivors of the exact-dedup pass -- fine at hundreds to a few
+thousand samples per source, NOT at tens/hundreds of thousands+ (a 338k-row
+pull is ~5.7*10^10 pairwise comparisons) -- pass --near-dup-threshold 0 at
+that scale to skip this pass entirely (exact-hash dedup is still O(n) and
+stays cheap regardless of scale).
 """
 import hashlib
+import io
 from dataclasses import dataclass, field
-from pathlib import Path
 
 from PIL import Image
 
 
 @dataclass
 class Record:
-    image_path: Path
+    image_bytes: bytes
     text: str
     source: str
     line_id: str
@@ -54,18 +54,14 @@ class DedupResult:
     near_duplicate_groups: list = field(default_factory=list)    # list[list[Record]], group[0] kept
 
 
-def sha256_file(path: Path, chunk_size: int = 65536) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(chunk_size), b""):
-            h.update(chunk)
-    return h.hexdigest()
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
 
-def phash(path: Path, hash_size: int = 16):
+def phash_bytes(data: bytes, hash_size: int = 16):
     import imagehash
 
-    with Image.open(path) as img:
+    with Image.open(io.BytesIO(data)) as img:
         return imagehash.phash(img, hash_size=hash_size)
 
 
@@ -87,7 +83,7 @@ def find_duplicates(records: list, near_dup_threshold: int = 10, hash_size: int 
     # -- pass 1: exact byte-identical duplicates --
     by_sha = {}
     for r in records:
-        by_sha.setdefault(sha256_file(r.image_path), []).append(r)
+        by_sha.setdefault(sha256_bytes(r.image_bytes), []).append(r)
 
     survivors, exact_groups, exact_dup_count = [], [], 0
     for group in by_sha.values():
@@ -100,7 +96,7 @@ def find_duplicates(records: list, near_dup_threshold: int = 10, hash_size: int 
     near_groups, near_dup_count = [], 0
     kept = survivors
     if near_dup_threshold > 0 and len(survivors) > 1:
-        hashes = [(r, phash(r.image_path, hash_size=hash_size)) for r in survivors]
+        hashes = [(r, phash_bytes(r.image_bytes, hash_size=hash_size)) for r in survivors]
         consumed = [False] * len(hashes)
         kept = []
         for i, (r_i, h_i) in enumerate(hashes):

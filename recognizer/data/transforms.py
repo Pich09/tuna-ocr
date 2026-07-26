@@ -1,6 +1,7 @@
 """Image loading/normalization + chunking -- the encoder's literal input
 unit is a fixed-width chunk, not the whole line (see recognizer/config.py's
 chunk_width/chunk_overlap and the top-level plan's Step 0.5)."""
+import io
 from pathlib import Path
 
 import numpy as np
@@ -14,10 +15,20 @@ BACKGROUND_VALUE = 0.98  # near-white in [0,1] after normalization below; matche
                           # isn't taught as "ink"
 
 
-def load_and_normalize(image_path: Path, target_height: int = 64) -> torch.Tensor:
+def open_image(image_source) -> Image.Image:
+    """Opens `image_source` whether it's a path (str/Path, the original
+    real_data manifest.tsv + loose files format) or raw image bytes (an
+    Arrow-packed sample, see recognizer/data/manifest.py's Sample.image_bytes) --
+    both formats are consumed identically from here on."""
+    if isinstance(image_source, (bytes, bytearray)):
+        return Image.open(io.BytesIO(image_source))
+    return Image.open(image_source)
+
+
+def load_and_normalize(image_source, target_height: int = 64) -> torch.Tensor:
     """Grayscale, resize to a fixed height (keeping aspect ratio), tensor in
     [0,1]. No dataset-computed mean/std -- deliberately simple for v1."""
-    img = Image.open(image_path).convert("L")
+    img = open_image(image_source).convert("L")
     w, h = img.size
     new_w = max(1, round(w * target_height / h))
     img = img.resize((new_w, target_height), Image.BILINEAR)
@@ -36,13 +47,13 @@ def pad_to_width(chunk: torch.Tensor, target_width: int) -> torch.Tensor:
     return torch.cat([chunk, pad], dim=2)
 
 
-def chunk_line_image(image_path: Path, chunk_width: int, chunk_overlap: int, target_height: int = 64):
-    """Loads the whole-line image and returns (chunk_tensors, valid_widths):
-    chunk_tensors is a list of (1, target_height, chunk_width) tensors (the
-    rare narrower-than-one-chunk line is right-padded), valid_widths is the
-    real (unpadded) pixel width of each chunk, for the encoder's frame-count
-    accounting."""
-    line_tensor = load_and_normalize(image_path, target_height)
+def chunk_line_image(image_source, chunk_width: int, chunk_overlap: int, target_height: int = 64):
+    """Loads the whole-line image (path or raw bytes, see open_image) and
+    returns (chunk_tensors, valid_widths): chunk_tensors is a list of
+    (1, target_height, chunk_width) tensors (the rare narrower-than-one-chunk
+    line is right-padded), valid_widths is the real (unpadded) pixel width
+    of each chunk, for the encoder's frame-count accounting."""
+    line_tensor = load_and_normalize(image_source, target_height)
     line_img = Image.fromarray((line_tensor.squeeze(0).numpy() * 255).astype(np.uint8), mode="L")
     chunks = chunk_image_overlap(line_img, chunk_width=chunk_width, overlap=chunk_overlap)
 

@@ -3,3 +3,4 @@ tqdm
 datasets
 huggingface_hub
 ImageHash
+pyarrow

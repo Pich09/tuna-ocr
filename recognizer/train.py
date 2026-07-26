@@ -166,7 +166,7 @@ def log_inference_samples(model, tokenizer, model_cfg, samples, device, logger, 
     model.eval()
     for i, sample in enumerate(samples):
         chunk_tensors, _ = chunk_line_image(
-            sample.image_path, model_cfg.chunk_width, model_cfg.chunk_overlap, model_cfg.img_height,
+            sample.image_source, model_cfg.chunk_width, model_cfg.chunk_overlap, model_cfg.img_height,
         )
         chunk_batch = torch.stack(chunk_tensors).to(device)
         chunks_per_line = torch.tensor([len(chunk_tensors)], dtype=torch.long, device=device)
@@ -211,7 +211,7 @@ def evaluate_val_cer(model, tokenizer, model_cfg, val_samples, device, char_voca
     with torch.no_grad():
         for sample in val_samples:
             chunk_tensors, _ = chunk_line_image(
-                sample.image_path, model_cfg.chunk_width, model_cfg.chunk_overlap, model_cfg.img_height,
+                sample.image_source, model_cfg.chunk_width, model_cfg.chunk_overlap, model_cfg.img_height,
             )
             chunk_batch = torch.stack(chunk_tensors).to(device)
             chunks_per_line = torch.tensor([len(chunk_tensors)], dtype=torch.long, device=device)

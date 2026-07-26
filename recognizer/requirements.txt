@@ -7,3 +7,4 @@ editdistance
 Pillow>=10.0.0
 numpy
 tqdm
+pyarrow
