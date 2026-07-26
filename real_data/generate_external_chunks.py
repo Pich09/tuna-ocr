@@ -194,4 +194,20 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # os._exit() rather than letting main() return into normal interpreter
+    # shutdown: the `datasets` library's streaming path spawns background
+    # fsspec/aiohttp threads that aren't always joined before Python starts
+    # finalizing, which can crash with "Fatal Python error: PyGILState_Release
+    # ... thread state must be current when releasing" -- observed on Colab,
+    # *after* all real work (writing the manifest/images) had already
+    # completed successfully. os._exit() skips that finalization path
+    # entirely, so a caller checking the exit code sees the real outcome
+    # (0 = actually succeeded) instead of a spurious crash on the way out.
+    import os
+
+    try:
+        main()
+        exit_code = 0
+    except SystemExit as e:
+        exit_code = e.code if isinstance(e.code, int) else 1
+    os._exit(exit_code)
