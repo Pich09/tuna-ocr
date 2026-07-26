@@ -155,11 +155,22 @@ def main():
     overlap = args.overlap if args.overlap is not None else chunk_cfg.overlap
 
     sources = list(EXTERNAL_DATASETS) if args.source == "all" else [args.source]
-    out_root = args.out_dir or (REAL_DATA_ROOT / "samples")
+    default_root = REAL_DATA_ROOT / "samples"
 
     summary = {}
     for source in sources:
-        out_dir = out_root / source if args.source == "all" else out_root
+        # Default (no --out-dir given): always nest under samples/<source>/, whether
+        # this is a single-source or --source all call -- a single named source with
+        # no explicit --out-dir used to fall through to the flat samples/ root
+        # instead, so every source clobbered the SAME manifest.tsv (each one's
+        # resume logic then found the *previous* source's leftover rows and thought
+        # it was resuming its own data). --out-dir, when explicitly passed for a
+        # single named source, is still honored exactly as given (e.g. to point one
+        # source at a custom location) -- it's only the *default* that was wrong.
+        if args.out_dir is not None and args.source != "all":
+            out_dir = args.out_dir
+        else:
+            out_dir = default_root / source
         out_dir.mkdir(parents=True, exist_ok=True)
         manifest_path = out_dir / "manifest.tsv"
         images_dir = out_dir / "images"
