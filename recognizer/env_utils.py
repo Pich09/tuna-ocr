@@ -18,11 +18,19 @@ _TPU_ENV_VARS = ("COLAB_TPU_ADDR", "TPU_NAME", "XRT_TPU_CONFIG")
 
 
 def detect_environment() -> str:
-    """Returns 'colab', 'kaggle', or 'local'."""
-    if "COLAB_RELEASE_TAG" in os.environ or "COLAB_GPU" in os.environ or "COLAB_TPU_ADDR" in os.environ:
-        return "colab"
+    """Returns 'colab', 'kaggle', or 'local'.
+
+    Kaggle is checked first: some Kaggle kernels leak a stray COLAB_GPU/
+    COLAB_RELEASE_TAG env var (likely shared base-image heritage with
+    Colab's TPU tooling), which would otherwise cause a Kaggle notebook to
+    misdetect as Colab and crash trying to mount Google Drive. The
+    "/kaggle/working" directory is a much harder signal to spoof than an
+    env var, so it takes priority.
+    """
     if "KAGGLE_KERNEL_RUN_TYPE" in os.environ or Path("/kaggle/working").is_dir():
         return "kaggle"
+    if "COLAB_RELEASE_TAG" in os.environ or "COLAB_GPU" in os.environ or "COLAB_TPU_ADDR" in os.environ:
+        return "colab"
     return "local"
 
 
