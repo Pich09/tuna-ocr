@@ -132,7 +132,7 @@ def lr_lambda(step: int, warmup_steps: int, max_steps: int, min_lr_ratio: float 
 
 
 def compute_loss(ctc_logits, ar_logits, batch, ctc_weight: float, pad_id: int, ctc_blank_id: int,
-                 enc_lengths=None):
+                 enc_lengths=None, ar_targets=None):
     b, t_max, _ = ctc_logits.shape
     log_probs = F.log_softmax(ctc_logits, dim=-1).transpose(0, 1)  # (T,N,C)
     # Real per-sample encoder lengths, not t_max: enc_out is zero-padded up to
@@ -148,8 +148,15 @@ def compute_loss(ctc_logits, ar_logits, batch, ctc_weight: float, pad_id: int, c
         log_probs, batch["ctc_targets"], ctc_input_lengths, batch["ctc_lengths"],
         blank=ctc_blank_id, zero_infinity=True,
     )
+    # ar_targets: whichever target tensor matches ar_logits' shape for the mode this
+    # step ran in -- (B, num_blocks, K) for blockwise, (B, L) flat for sequential (see
+    # run_training's ar_mode/ar_targets_for_mode). Defaults to batch["ar_targets"] for
+    # callers that don't pass it explicitly (e.g. find_max_batch_size's OOM probe,
+    # which always probes blockwise mode).
+    if ar_targets is None:
+        ar_targets = batch["ar_targets"]
     ce_loss = F.cross_entropy(
-        ar_logits.reshape(-1, ar_logits.shape[-1]), batch["ar_targets"].reshape(-1),
+        ar_logits.reshape(-1, ar_logits.shape[-1]), ar_targets.reshape(-1),
         ignore_index=pad_id,
     )
     loss = ctc_weight * ctc_loss + (1 - ctc_weight) * ce_loss
@@ -157,7 +164,8 @@ def compute_loss(ctc_logits, ar_logits, batch, ctc_weight: float, pad_id: int, c
 
 
 @torch.no_grad()
-def log_inference_samples(model, tokenizer, model_cfg, samples, device, logger, step, char_vocab=None):
+def log_inference_samples(model, tokenizer, model_cfg, samples, device, logger, step, char_vocab=None,
+                          mode: str = "blockwise"):
     """Greedy-decodes a handful of fixed held-out samples and logs
     prediction vs ground truth -- a cheap, human-readable sanity check that
     the model is actually learning to read (not just that the loss number
@@ -171,8 +179,11 @@ def log_inference_samples(model, tokenizer, model_cfg, samples, device, logger, 
         chunk_batch = torch.stack(chunk_tensors).to(device)
         chunks_per_line = torch.tensor([len(chunk_tensors)], dtype=torch.long, device=device)
         enc_out, enc_lengths, enc_block_ids = model.encode(chunk_batch, chunks_per_line)
-        max_blocks = min(len(chunk_tensors), 256 // max(1, model_cfg.max_tokens_per_block) + 1)
-        tokens = model.decoder.decode_greedy(enc_out, enc_lengths, enc_block_ids, max_blocks)[0].tolist()
+        if mode == "sequential":
+            tokens = model.decoder.decode_greedy_sequential(enc_out, enc_lengths)[0].tolist()
+        else:
+            max_blocks = min(len(chunk_tensors), 256 // max(1, model_cfg.max_tokens_per_block) + 1)
+            tokens = model.decoder.decode_greedy(enc_out, enc_lengths, enc_block_ids, max_blocks)[0].tolist()
         pred = tokenizer.decode(tokens, strip_control=True)
         # CTC greedy is the encoder's own read-out: it is alignment-free and
         # not exposed to the decoder's exposure bias, so it is the earliest
@@ -192,7 +203,7 @@ def log_inference_samples(model, tokenizer, model_cfg, samples, device, logger, 
         model.train()
 
 
-def evaluate_val_cer(model, tokenizer, model_cfg, val_samples, device, char_vocab):
+def evaluate_val_cer(model, tokenizer, model_cfg, val_samples, device, char_vocab, mode: str = "blockwise"):
     """Greedy-decodes the whole held-out val set and returns (ar_cer, ctc_cer)
     -- a real quantitative performance number to track alongside the loss
     (loss can keep falling on train while val CER climbs; that gap is the
@@ -216,8 +227,11 @@ def evaluate_val_cer(model, tokenizer, model_cfg, val_samples, device, char_voca
             chunk_batch = torch.stack(chunk_tensors).to(device)
             chunks_per_line = torch.tensor([len(chunk_tensors)], dtype=torch.long, device=device)
             enc_out, enc_lengths, enc_block_ids = model.encode(chunk_batch, chunks_per_line)
-            max_blocks = min(len(chunk_tensors), 256 // max(1, model_cfg.max_tokens_per_block) + 1)
-            tokens = model.decoder.decode_greedy(enc_out, enc_lengths, enc_block_ids, max_blocks)[0].tolist()
+            if mode == "sequential":
+                tokens = model.decoder.decode_greedy_sequential(enc_out, enc_lengths)[0].tolist()
+            else:
+                max_blocks = min(len(chunk_tensors), 256 // max(1, model_cfg.max_tokens_per_block) + 1)
+                tokens = model.decoder.decode_greedy(enc_out, enc_lengths, enc_block_ids, max_blocks)[0].tolist()
             ar_refs.append(sample.text)
             ar_hyps.append(tokenizer.decode(tokens, strip_control=True))
             ctc_ids = model.ctc_head(enc_out).argmax(-1)[0]
@@ -381,18 +395,28 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
                     f"({train_cfg.max_steps - step} steps remaining to max_steps={train_cfg.max_steps})")
 
     ctc_blank_id = char_vocab.blank_id
+    if train_cfg.sequential_ar_steps > 0:
+        logger.info(f"AR decoder training curriculum: sequential mode for steps 0-"
+                    f"{train_cfg.sequential_ar_steps} (plain teacher forcing, unrestricted "
+                    f"cross-attention -- see modules/decoder.py), then blockwise for the rest.")
+    ar_mode_logged_switch = train_cfg.sequential_ar_steps <= 0  # already "switched" if disabled from the start
     model.train()
     t0 = time.time()
     while step < train_cfg.max_steps:
         for batch in loader:
             if step >= train_cfg.max_steps:
                 break
+            ar_mode = "sequential" if step < train_cfg.sequential_ar_steps else "blockwise"
+            if ar_mode == "blockwise" and not ar_mode_logged_switch:
+                logger.info(f"step {step}: switching AR decoder from sequential to blockwise mode")
+                ar_mode_logged_switch = True
             batch = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
+            ar_targets_for_mode = batch["ar_flat_targets"] if ar_mode == "sequential" else batch["ar_targets"]
             ctc_logits, ar_logits, enc_lengths = model(
-                batch["chunks"], batch["chunks_per_line"], batch["ar_targets"])
+                batch["chunks"], batch["chunks_per_line"], ar_targets_for_mode, mode=ar_mode)
             loss, ctc_loss, ce_loss = compute_loss(
                 ctc_logits, ar_logits, batch, train_cfg.ctc_weight, tokenizer.pad_id, ctc_blank_id,
-                enc_lengths=enc_lengths,
+                enc_lengths=enc_lengths, ar_targets=ar_targets_for_mode,
             )
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -414,11 +438,11 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
 
             if train_cfg.sample_every > 0 and step % train_cfg.sample_every == 0 and inference_samples:
                 log_inference_samples(model, tokenizer, model_cfg, inference_samples, device, logger, step,
-                                      char_vocab=char_vocab)
+                                      char_vocab=char_vocab, mode=ar_mode)
 
             if train_cfg.eval_every > 0 and step % train_cfg.eval_every == 0 and val_samples:
                 ar_cer, ctc_cer = evaluate_val_cer(
-                    model, tokenizer, model_cfg, val_samples, device, char_vocab)
+                    model, tokenizer, model_cfg, val_samples, device, char_vocab, mode=ar_mode)
                 epoch = step / steps_per_epoch
                 logger.info(f"eval step {step} epoch {epoch:.2f} val_ar_cer {ar_cer:.4f} "
                             f"val_ctc_cer {ctc_cer:.4f} (n={len(val_samples)})")
@@ -478,6 +502,12 @@ def main():
     parser.add_argument("--num-workers", type=int, default=None,
                          help="DataLoader worker processes for image loading/decoding. 0 = synchronous "
                               "(main process only) -- keep >0 to avoid GPU idling on CPU-bound decode.")
+    parser.add_argument("--sequential-ar-steps", type=int, default=None,
+                         help="Train the AR decoder in plain sequential mode (full teacher forcing, "
+                              "unrestricted cross-attention) for this many initial steps before switching "
+                              "to blockwise mode for the rest of the run -- see modules/decoder.py's "
+                              "'Two-stage training' note. 0 (default) disables this and trains blockwise "
+                              "from step 0.")
     parser.add_argument("--push-to-hub", action="store_true")
     parser.add_argument("--hub-public", action="store_true",
                          help="Make the pushed HF checkpoint repo public (default: private).")
@@ -504,6 +534,8 @@ def main():
         train_cfg.eval_every = args.eval_every
     if args.num_workers is not None:
         train_cfg.num_workers = args.num_workers
+    if args.sequential_ar_steps is not None:
+        train_cfg.sequential_ar_steps = args.sequential_ar_steps
 
     run_training(
         model_cfg, train_cfg, real_data_roots=args.real_data_dirs, dedup_manifest_path=args.dedup_manifest,

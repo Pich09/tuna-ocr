@@ -22,6 +22,30 @@ block b-1's already-decided tokens).
 Known v1 simplification: inference recomputes the whole prefix on every
 block step (no KV-cache) -- fine for short OCR lines, noted as a future
 optimization in recognizer/README.md.
+
+Two-stage training (forward_sequential / decode_greedy_sequential): the
+blockwise supervision above depends on ar_target's uniform-interval split
+of each transcript into per-block token groups -- an approximation, since
+none of these datasets provide real per-character alignment, and a group's
+boundary frequently does not match where those characters actually appear
+in that block's image region. Training blockwise from scratch teaches the
+decoder to reproduce that approximate partitioning rather than real
+image-to-text correspondence (observed in practice: AR val CER stuck well
+above CTC's on the same encoder, despite near-zero AR train loss -- a
+sign of fitting the wrong target, not slow learning).
+
+forward_sequential instead runs plain, fully-sequential teacher forcing
+over the TRUE (unsegmented) token sequence, with cross-attention over the
+WHOLE line's encoder output (no per-block window) -- exactly like a
+standard transformer decoder, so cross-attention is free to discover the
+real alignment on its own (the same way CTC does). The recommended
+training curriculum is to spend an initial fraction of steps in this mode
+(see TrainConfig.sequential_ar_steps) so token_emb/pos_enc/layers/ln_final
+-- all shared with blockwise mode -- learn genuine image-to-text
+correspondence first, before switching to blockwise's parallel per-block
+K-way head for the remainder of the run (for inference-time speed). Only
+block_head vs token_head differ per mode; the shared trunk is what
+benefits from this staging.
 """
 import torch
 import torch.nn as nn
@@ -66,6 +90,12 @@ class BlockwiseARDecoder(nn.Module):
         ])
         self.ln_final = nn.LayerNorm(cfg.d_model)
         self.block_head = nn.Linear(cfg.d_model, self.K * vocab_size)
+        # Separate per-position head for the sequential-AR training stage (see
+        # module docstring's "Two-stage training") -- block_head predicts all K
+        # slots of a block from ONE pre-block hidden state, which is a different
+        # projection than an ordinary per-position next-token head, so the two
+        # aren't shared, only token_emb/pos_enc/layers/ln_final are.
+        self.token_head = nn.Linear(cfg.d_model, vocab_size)
 
     def _shift_right(self, flat_ids: torch.Tensor) -> torch.Tensor:
         b = flat_ids.shape[0]
@@ -105,6 +135,51 @@ class BlockwiseARDecoder(nn.Module):
         idx = torch.arange(0, num_blocks * k, k, device=x.device)
         h_prefix = x[:, idx, :]  # (B, num_blocks, D) -- hidden state right before each block starts
         return self.block_head(h_prefix).view(b, num_blocks, k, self.vocab_size)
+
+    def forward_sequential(self, enc_out: torch.Tensor, enc_lengths: torch.Tensor,
+                            seq_targets: torch.Tensor) -> torch.Tensor:
+        """seq_targets: (B, L) teacher-forced flat token sequence (already
+        includes a trailing <eos>, see data/dataset.py's ar_flat_target).
+        Cross-attention sees the FULL line's encoder output -- no per-block
+        window -- so alignment is discovered by attention, not assumed from a
+        uniform split. Returns logits: (B, L, vocab_size)."""
+        dec_in = self._shift_right(seq_targets)
+        x = self.token_emb(dec_in) + self.pos_enc(dec_in.shape[1]).unsqueeze(0)
+        l_dec = dec_in.shape[1]
+        t_enc = enc_out.shape[1]
+        enc_len_mask = torch.arange(t_enc, device=enc_out.device).unsqueeze(0) < enc_lengths.unsqueeze(1)
+        causal = torch.tril(torch.ones(l_dec, l_dec, dtype=torch.bool, device=enc_out.device))
+        self_mask = causal.unsqueeze(0).unsqueeze(0)  # (1,1,L,L)
+        cross_mask = enc_len_mask.unsqueeze(1).unsqueeze(1)  # (B,1,1,T') -- full visibility, padding excluded
+        for layer in self.layers:
+            x = layer(x, enc_out, self_mask, cross_mask)
+        x = self.ln_final(x)
+        return self.token_head(x)
+
+    @torch.no_grad()
+    def decode_greedy_sequential(self, enc_out: torch.Tensor, enc_lengths: torch.Tensor,
+                                  max_len: int = 256) -> torch.Tensor:
+        """Ordinary one-token-at-a-time greedy decoding (recomputes the whole
+        prefix each step -- same known v1 no-KV-cache simplification as
+        decode_greedy). Returns (B, <=max_len) token ids, NOT including the
+        leading <bos>; caller truncates each sample at its first <eos>/<pad>."""
+        b = enc_out.shape[0]
+        device = enc_out.device
+        t_enc = enc_out.shape[1]
+        enc_len_mask = torch.arange(t_enc, device=device).unsqueeze(0) < enc_lengths.unsqueeze(1)
+        cross_mask = enc_len_mask.unsqueeze(1).unsqueeze(1)
+        generated = torch.full((b, 1), self.bos_id, dtype=torch.long, device=device)
+        for _ in range(max_len):
+            l_dec = generated.shape[1]
+            x = self.token_emb(generated) + self.pos_enc(l_dec).unsqueeze(0)
+            causal = torch.tril(torch.ones(l_dec, l_dec, dtype=torch.bool, device=device)).unsqueeze(0).unsqueeze(0)
+            for layer in self.layers:
+                x = layer(x, enc_out, causal, cross_mask)
+            x = self.ln_final(x)
+            next_logits = self.token_head(x[:, -1, :])
+            next_tok = next_logits.argmax(dim=-1, keepdim=True)
+            generated = torch.cat([generated, next_tok], dim=1)
+        return generated[:, 1:]  # drop the leading <bos>
 
     @torch.no_grad()
     def decode_greedy(self, enc_out: torch.Tensor, enc_lengths: torch.Tensor, enc_block_ids: torch.Tensor,

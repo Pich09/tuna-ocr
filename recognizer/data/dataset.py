@@ -78,6 +78,13 @@ class OCRLineDataset(Dataset):
             "valid_widths": valid_widths,
             "ctc_target": torch.tensor(ctc_ids, dtype=torch.long),
             "ar_target": torch.tensor(ar_rows, dtype=torch.long),
+            # Plain (unsegmented) token sequence + trailing <eos> -- used for the
+            # sequential-AR training stage (see modules/decoder.py's
+            # forward_sequential): unlike ar_target, this carries NO uniform-split
+            # block-boundary artifacts, since sequential mode's cross-attention
+            # isn't restricted to a per-block encoder-frame window and so has no
+            # need for the (approximate) block-target partitioning at all.
+            "ar_flat_target": torch.tensor(token_ids + [self.tokenizer.eos_id], dtype=torch.long),
             "text": sample.text,
         }
 
@@ -103,11 +110,17 @@ def make_collate_fn(tokenizer, chunk_width: int):
             nb = b["ar_target"].shape[0]
             ar_targets[i, :nb] = b["ar_target"]
 
+        max_flat_len = max(len(b["ar_flat_target"]) for b in batch)
+        ar_flat_targets = torch.full((len(batch), max_flat_len), pad_id, dtype=torch.long)
+        for i, b in enumerate(batch):
+            ar_flat_targets[i, : len(b["ar_flat_target"])] = b["ar_flat_target"]
+
         return {
             "chunks": all_chunks,
             "chunks_per_line": chunks_per_line,
             "valid_widths": valid_widths,
             "ctc_targets": ctc_targets,
+            "ar_flat_targets": ar_flat_targets,
             "ctc_lengths": ctc_lengths,
             "ar_targets": ar_targets,
             "texts": [b["text"] for b in batch],

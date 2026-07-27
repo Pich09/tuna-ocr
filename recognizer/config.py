@@ -47,3 +47,9 @@ class TrainConfig:
     num_samples: int = 3
     num_workers: int = 8
     seed: int = 0
+    # Initial steps trained with the decoder's plain sequential-AR mode (full
+    # teacher forcing over the true token sequence, unrestricted cross-attention)
+    # before switching to blockwise mode for the rest of the run -- see
+    # modules/decoder.py's "Two-stage training" docstring section. 0 (default)
+    # disables this and trains blockwise from step 0, matching prior behavior.
+    sequential_ar_steps: int = 0

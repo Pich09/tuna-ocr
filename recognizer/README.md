@@ -57,6 +57,19 @@ provides real per-token alignment, each sample's tagged token sequence is
 uniform-split into one run per chunk/block for teacher forcing -- a known
 v1 approximation (see Known gaps below).
 
+Training blockwise from step 0 teaches the decoder to reproduce that
+approximate split rather than real image-to-text correspondence (observed
+in practice: AR val CER stuck well above CTC's on the same encoder,
+despite near-zero AR train loss). `TrainConfig.sequential_ar_steps`
+(`--sequential-ar-steps` on the CLI) trains an initial fraction of steps in
+a plain sequential-AR mode instead -- full teacher forcing over the true
+token sequence, unrestricted cross-attention, so alignment is discovered
+by attention rather than assumed from a uniform split -- then switches to
+blockwise for the rest of the run. Only the output head differs per mode
+(`token_head` vs `block_head`); the shared trunk (embeddings, positional
+encoding, decoder layers) carries over. See `modules/decoder.py`'s
+"Two-stage training" docstring section for the full mechanism.
+
 ## Tokenizer
 
 Uses the project's shared tokenizer, `Panhapich/khmer-sp-8k`
