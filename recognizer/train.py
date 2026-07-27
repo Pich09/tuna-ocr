@@ -261,7 +261,16 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
         import torch_xla.core.xla_model as xm  # noqa: PLC0415
     torch.manual_seed(train_cfg.seed)
 
+    # print()s (not logger -- the logger isn't built until further down, once
+    # ckpt_dir exists) with flush=True at each stage up through the first real
+    # logger.info() call: this whole preamble ran in a handful of seconds
+    # against the real ~430k-row production dataset when benchmarked directly
+    # (load_dedup_manifest ~5-14s, compute_widths ~13s), so if a run is stuck
+    # with no output for a long time, these pin down exactly which stage it's
+    # actually stuck in, rather than leaving a single opaque multi-step gap.
+    print("run_training: loading tokenizer...", flush=True)
     tokenizer = KhmerOcrTokenizer(tokenizer_dir)
+    print(f"run_training: loading samples from {dedup_manifest_path or real_data_roots}...", flush=True)
     if dedup_manifest_path:
         samples = load_dedup_manifest(dedup_manifest_path)
     elif real_data_roots:
@@ -272,6 +281,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
         raise RuntimeError(f"No samples found (dedup_manifest_path={dedup_manifest_path}, "
                             f"real_data_roots={real_data_roots}) -- generate/deduplicate data first with "
                             f"`python -m real_data.generate_external_chunks` and `python -m real_data.deduplicate`.")
+    print(f"run_training: loaded {len(samples)} samples, shuffling/splitting...", flush=True)
     # Shuffle before splitting: the pooled manifest is written source-by-
     # source, so a head slice would make the whole val set (and every sampled
     # prediction) come from one source only.
@@ -287,6 +297,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
     ckpt_dir_early = Path(checkpoint_root) / run_name
     ckpt_dir_early.mkdir(parents=True, exist_ok=True)
     char_vocab_path = ckpt_dir_early / "char_vocab.json"
+    print(f"run_training: {'loading' if char_vocab_path.exists() else 'building'} char vocab...", flush=True)
     if char_vocab_path.exists():
         char_vocab = CharVocab.load(char_vocab_path)
     else:
@@ -296,6 +307,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
     train_ds = OCRLineDataset(train_samples, tokenizer, model_cfg, char_vocab=char_vocab)
     collate_fn = make_collate_fn(tokenizer, model_cfg.chunk_width)
 
+    print(f"run_training: building model + moving to {device}...", flush=True)
     model = Recognizer(model_cfg, tokenizer.vocab_size, bos_id=tokenizer.bos_id,
                        pad_id=tokenizer.pad_id, ctc_vocab_size=char_vocab.size).to(device)
 
