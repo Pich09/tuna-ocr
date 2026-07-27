@@ -4,6 +4,11 @@ from pathlib import Path
 
 REAL_DATA_ROOT = Path(__file__).resolve().parent
 
+# Holds the packed+deduplicated dataset (see pack_arrow.py, deduplicate.py,
+# hf_push.py) -- lets the pull->pack->dedup pipeline run once and be reused
+# across sessions/notebooks instead of repeating it every time.
+HF_DATA_REPO_ID = "Panhapich/tuna-ocr-data"
+
 
 @dataclass
 class ExternalChunkConfig:
