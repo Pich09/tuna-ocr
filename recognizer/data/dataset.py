@@ -129,6 +129,25 @@ def make_collate_fn(tokenizer, chunk_width: int):
     return collate_fn
 
 
+# Batch entries that must stay on the host. `chunks_per_line` is never fed to a
+# layer -- it only drives Python control flow (`.tolist()` in
+# ConformerEncoder.forward, `.max()` in the decode paths). Moving it to the
+# accelerator and reading it back forces a device->host sync on every step,
+# which on XLA/TPU serializes the whole asynchronous execution pipeline (the
+# graph must run to completion before the loop can even decide its shapes) and
+# on CUDA costs a needless stall. Keeping it on the CPU makes those reads free.
+HOST_ONLY_BATCH_KEYS = frozenset({"chunks_per_line"})
+
+
+def move_batch(batch: dict, device) -> dict:
+    """Moves a collated batch to `device`, leaving HOST_ONLY_BATCH_KEYS and
+    non-tensor entries (e.g. `texts`) on the CPU."""
+    return {
+        k: (v.to(device) if torch.is_tensor(v) and k not in HOST_ONLY_BATCH_KEYS else v)
+        for k, v in batch.items()
+    }
+
+
 def compute_widths(dataset: "OCRLineDataset", num_workers: int = 32, cache_path: Path = None) -> list:
     """Per-sample image width, threaded (I/O-bound: PIL's lazy header read
     releases the GIL during the actual file read) -- at millions of samples

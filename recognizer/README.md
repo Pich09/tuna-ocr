@@ -160,19 +160,42 @@ cell for platform setup (Drive mount, HF secret name: `HF_TOKEN`).
 ### CPU / GPU / TPU
 
 The training device is auto-detected (`env_utils.get_torch_device()`) --
-CLI and notebook both pick it up with no flag needed:
+CLI and notebook both pick it up with no flag needed. Call
+`env_utils.describe_accelerator()` (the notebook's section 1 does) to print
+the resolved device before committing to a long run.
+
+`detect_accelerator()` checks CUDA first -- a cheap, unambiguous query, and
+no Colab/Kaggle runtime offers both -- then probes for a TPU in increasing
+order of cost: `PJRT_DEVICE=TPU` (compared by *value*: it is also set to
+`CUDA`/`CPU`), then the `TPU_*`/`COLAB_TPU_ADDR`/`XRT_TPU_CONFIG` env vars,
+then the `/dev/accel*` device nodes, then `torch_xla.runtime.device_type()`
+if torch_xla is installed. Both TPU generations are covered on purpose:
+checking only the XRT-era vars (`COLAB_TPU_ADDR`/`XRT_TPU_CONFIG`) misses
+every current PJRT runtime, which then silently trains on CPU.
+
 - **GPU**: batch size is auto-probed to fit available VRAM
   (`--auto-batch-size` / the notebook's `auto_batch_size=True`) by trying a
   candidate size and halving on CUDA OOM.
 - **TPU**: select the TPU runtime/accelerator on Colab or Kaggle *before*
   starting (both ship `torch_xla` preinstalled there -- no extra install
   needed). Training uses `xm.optimizer_step`/`xm.save` instead of the plain
-  `optimizer.step`/`torch.save` calls. The VRAM auto-probe is skipped on TPU
-  (XLA doesn't surface a catchable Python OOM the same way); the configured
-  `batch_size` is used as-is. **Caveat**: PyTorch/XLA's CTC op support has
-  historically been inconsistent across versions -- if `compute_loss`'s
-  `F.ctc_loss` call errors or is unexpectedly slow on your TPU runtime,
-  check for a CPU fallback before assuming it's a bug in this repo.
+  `optimizer.step`/`torch.save` calls. The VRAM auto-probe is CUDA-only
+  (XLA compiles lazily and doesn't surface a catchable Python OOM); on
+  TPU/CPU the configured `batch_size` is used as-is, and asking for
+  auto-sizing anyway just logs that and moves on. **Caveats**:
+  PyTorch/XLA's CTC op support has historically been inconsistent across
+  versions -- if `compute_loss`'s `F.ctc_loss` call errors or is
+  unexpectedly slow on your TPU runtime, check for a CPU fallback before
+  assuming it's a bug in this repo. And because batches are variable-shaped
+  by design (width bucketing), XLA compiles one graph per distinct shape:
+  expect a few hundred recompiles before the cache covers the common shapes.
+
+`chunks_per_line` is deliberately left on the host by `move_batch` rather
+than shipped to the accelerator with the rest of the batch: it only drives
+Python control flow (`.tolist()` in `ConformerEncoder.forward`, `.max()` in
+the decode paths), and reading it back from the device would force a
+host sync every step -- which on XLA serializes the whole asynchronous
+execution pipeline, and on CUDA is a needless stall.
 
 ## Evaluation / inference
 

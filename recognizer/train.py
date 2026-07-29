@@ -41,7 +41,8 @@ from torch.utils.data import DataLoader
 from . import env_utils
 from .config import ModelConfig, TrainConfig, DEFAULT_CHECKPOINT_ROOT, TOKENIZER_ASSETS_DIR
 from .data.char_vocab import CharVocab, build_char_vocab
-from .data.dataset import BucketBatchSampler, OCRLineDataset, compute_widths, make_collate_fn
+from .data.dataset import (BucketBatchSampler, OCRLineDataset, compute_widths, make_collate_fn,
+                           move_batch)
 from .data.manifest import build_combined_index, load_dedup_manifest
 from .data.transforms import chunk_line_image
 from .hf_push import push_checkpoint
@@ -106,7 +107,7 @@ def find_max_batch_size(model, dataset, collate_fn, device, widths, start: int =
         try:
             idxs = widest_idx[:bs]
             batch = collate_fn([dataset[i] for i in idxs])
-            batch = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
+            batch = move_batch(batch, device)
             ctc_logits, ar_logits, _ = model(batch["chunks"], batch["chunks_per_line"], batch["ar_targets"])
             (ctc_logits.float().sum() + ar_logits.float().sum()).backward()
             optim_reserve = torch.empty(optim_state_bytes, dtype=torch.uint8, device=device)
@@ -326,9 +327,19 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
     logger.info(f"image widths ready in {time.time() - t_w:.1f}s (cache: {widths_cache})")
 
     batch_size = train_cfg.batch_size
-    if auto_batch_size:
+    if auto_batch_size and device.type == "cuda":
         batch_size = find_max_batch_size(model, train_ds, collate_fn, device, widths, start=max(64, train_cfg.batch_size))
         logger.info(f"auto batch size: {batch_size}")
+    elif auto_batch_size:
+        # Gated on CUDA at the call site, not just inside the probe: the probe's
+        # non-CUDA early-return hands back its `start` argument, which is
+        # max(64, batch_size) -- i.e. asking for auto-sizing on TPU/CPU used to
+        # silently *raise* the batch size to 64 rather than leave the config
+        # alone, which is the opposite of the documented "just use the
+        # configured default" behaviour.
+        logger.info(f"auto batch size requested but device is {device.type} (OOM probing is "
+                    f"CUDA-only -- XLA compiles lazily and doesn't raise a catchable Python "
+                    f"OOM); using the configured batch_size={batch_size}")
 
     steps_per_epoch = max(1, len(train_ds) // batch_size)
     logger.info(f"batch_size={batch_size}, ~{steps_per_epoch} steps/epoch, max_steps={train_cfg.max_steps} "
@@ -422,7 +433,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
             if ar_mode == "blockwise" and not ar_mode_logged_switch:
                 logger.info(f"step {step}: switching AR decoder from sequential to blockwise mode")
                 ar_mode_logged_switch = True
-            batch = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
+            batch = move_batch(batch, device)
             ar_targets_for_mode = batch["ar_flat_targets"] if ar_mode == "sequential" else batch["ar_targets"]
             ctc_logits, ar_logits, enc_lengths = model(
                 batch["chunks"], batch["chunks_per_line"], ar_targets_for_mode, mode=ar_mode)

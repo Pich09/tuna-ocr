@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 from . import env_utils
 from .config import ModelConfig, TOKENIZER_ASSETS_DIR
 from .data.char_vocab import CharVocab
-from .data.dataset import OCRLineDataset, make_collate_fn
+from .data.dataset import OCRLineDataset, make_collate_fn, move_batch
 from .data.manifest import build_combined_index
 from .modules.model import Recognizer
 from .tokenizer.khmer_ocr_tokenizer import KhmerOcrTokenizer
@@ -79,7 +79,7 @@ def evaluate(checkpoint_path: Path, real_data_roots, tokenizer_dir=TOKENIZER_ASS
     refs, ar_hyps, ctc_hyps = [], [], []
     ctc_blank_id = char_vocab.blank_id if char_vocab else tokenizer.vocab_size
     for batch in loader:
-        batch = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
+        batch = move_batch(batch, device)
         enc_out, enc_lengths, enc_block_ids = model.encode(batch["chunks"], batch["chunks_per_line"])
         max_blocks = int(batch["chunks_per_line"].max())
         ar_tokens = model.decoder.decode_greedy(enc_out, enc_lengths, enc_block_ids, max_blocks)

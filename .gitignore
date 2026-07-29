@@ -13,3 +13,8 @@ recognizer/tokenizer/assets/
 recognizer/checkpoints/
 
 .ipynb_checkpoints/
+
+# One of the HF-token fallback locations the training notebook reads (see its
+# section 1). Ignored so a token dropped here can never reach a commit --
+# GitHub's push protection rejects that outright and HF auto-revokes the token.
+hf_token.txt
