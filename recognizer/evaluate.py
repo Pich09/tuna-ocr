@@ -20,6 +20,7 @@ from .config import ModelConfig, TOKENIZER_ASSETS_DIR
 from .data.char_vocab import CharVocab
 from .data.dataset import OCRLineDataset, make_collate_fn, move_batch
 from .data.manifest import build_combined_index
+from .modules.decoder import truncate_blocks
 from .modules.model import Recognizer
 from .tokenizer.khmer_ocr_tokenizer import KhmerOcrTokenizer
 
@@ -30,13 +31,18 @@ def compute_cer(refs: list, hyps: list) -> float:
     return total_edits / total_len
 
 
-def ctc_greedy_decode(ctc_logits: torch.Tensor, ctc_blank_id: int) -> list:
-    """argmax + collapse-repeats + drop-blank, per sample."""
-    ids = ctc_logits.argmax(dim=-1)  # (B,T)
+def ctc_greedy_decode(ctc_logits: torch.Tensor, ctc_blank_id: int, enc_lengths: torch.Tensor = None) -> list:
+    """argmax + collapse-repeats + drop-blank, per sample. `enc_lengths`
+    bounds each row to its real frames: enc_out is zero-padded to the batch
+    max, and the CTC head's argmax over those zero vectors is an arbitrary
+    class -- without the bound, every shorter line in a batch grew a garbage
+    tail decoded from padding."""
+    ids = ctc_logits.argmax(dim=-1).cpu()  # (B,T); one transfer, not one .item() per frame
+    lengths = enc_lengths.cpu().tolist() if enc_lengths is not None else [ids.shape[1]] * ids.shape[0]
     out = []
-    for row in ids.tolist():
+    for row, n in zip(ids.tolist(), lengths):
         collapsed, prev = [], None
-        for i in row:
+        for i in row[:n]:
             if i != prev and i != ctc_blank_id:
                 collapsed.append(i)
             prev = i
@@ -58,7 +64,8 @@ def load_model(checkpoint_path: Path, tokenizer: KhmerOcrTokenizer, device):
     char_vocab = CharVocab.from_json(state["char_vocab"]) if "char_vocab" in state else None
     model = Recognizer(model_cfg, tokenizer.vocab_size, bos_id=tokenizer.bos_id,
                        pad_id=tokenizer.pad_id,
-                       ctc_vocab_size=char_vocab.size if char_vocab else None).to(device)
+                       ctc_vocab_size=char_vocab.size if char_vocab else None,
+                       eos_id=tokenizer.eos_id, eob_id=tokenizer.eob_id).to(device)
     model.load_state_dict(state["model_state_dict"])
     model.eval()
     return model, model_cfg, char_vocab
@@ -84,10 +91,16 @@ def evaluate(checkpoint_path: Path, real_data_roots, tokenizer_dir=TOKENIZER_ASS
         max_blocks = int(batch["chunks_per_line"].max())
         ar_tokens = model.decoder.decode_greedy(enc_out, enc_lengths, enc_block_ids, max_blocks)
         ctc_logits = model.ctc_head(enc_out)
-        ctc_tokens = ctc_greedy_decode(ctc_logits, ctc_blank_id)
+        ctc_tokens = ctc_greedy_decode(ctc_logits, ctc_blank_id, enc_lengths=enc_lengths)
 
-        for text, ar_row, ctc_row in zip(batch["texts"], ar_tokens.tolist(), ctc_tokens):
+        chunks_per_line = batch["chunks_per_line"].tolist()
+        for text, ar_row, ctc_row, n_blocks in zip(batch["texts"], ar_tokens.tolist(), ctc_tokens, chunks_per_line):
             refs.append(text)
+            # Per-block truncation: within each K-slot block keep tokens up to
+            # the first <eob>/<pad>, and drop blocks decoded past this line's
+            # real chunk count (the batch decodes every line to the batch max).
+            ar_row = truncate_blocks(ar_row, model_cfg.max_tokens_per_block,
+                                     tokenizer.eob_id, tokenizer.pad_id, num_blocks=n_blocks)
             ar_hyps.append(tokenizer.decode(ar_row))
             # CTC labels are characters when a char vocab is present -- decoding
             # them through the subword tokenizer would be meaningless.

@@ -13,6 +13,7 @@ from . import env_utils
 from .config import TOKENIZER_ASSETS_DIR
 from .data.transforms import chunk_line_image
 from .evaluate import load_model
+from .modules.decoder import truncate_blocks
 from .tokenizer.khmer_ocr_tokenizer import KhmerOcrTokenizer
 
 
@@ -30,6 +31,7 @@ def infer(checkpoint_path: Path, image_path: Path, tokenizer_dir=TOKENIZER_ASSET
     enc_out, enc_lengths, enc_block_ids = model.encode(chunk_batch, chunks_per_line)
     max_blocks = min(len(chunk_tensors), max_len // max(1, model_cfg.max_tokens_per_block) + 1)
     tokens = model.decoder.decode_greedy(enc_out, enc_lengths, enc_block_ids, max_blocks)[0].tolist()
+    tokens = truncate_blocks(tokens, model_cfg.max_tokens_per_block, tokenizer.eob_id, tokenizer.pad_id)
     return tokenizer.decode(tokens, strip_control=not keep_tags)
 
 

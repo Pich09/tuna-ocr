@@ -7,7 +7,8 @@ from .encoder import ConformerEncoder
 
 
 class Recognizer(nn.Module):
-    def __init__(self, cfg, vocab_size: int, bos_id: int, pad_id: int, ctc_vocab_size: int = None):
+    def __init__(self, cfg, vocab_size: int, bos_id: int, pad_id: int, ctc_vocab_size: int = None,
+                 eos_id: int = None, eob_id: int = None):
         super().__init__()
         self.encoder = ConformerEncoder(cfg)
         # `ctc_vocab_size` is the CTC head's OWN label-set size (blank
@@ -19,7 +20,9 @@ class Recognizer(nn.Module):
         # blank) so older checkpoints still load.
         self.ctc_vocab_size = ctc_vocab_size if ctc_vocab_size is not None else vocab_size + 1
         self.ctc_head = nn.Linear(cfg.d_model, self.ctc_vocab_size)
-        self.decoder = BlockwiseARDecoder(cfg, vocab_size, bos_id, pad_id)
+        # eos_id/eob_id are parameter-free (decode-time behavior only), so
+        # checkpoints from before they existed still load -- see decoder.py.
+        self.decoder = BlockwiseARDecoder(cfg, vocab_size, bos_id, pad_id, eos_id=eos_id, eob_id=eob_id)
 
     def forward(self, chunk_batch, chunks_per_line, ar_targets, mode: str = "blockwise"):
         """mode="blockwise" (default): ar_targets is (B, num_blocks, K), uses

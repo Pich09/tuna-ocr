@@ -55,6 +55,40 @@ from .conformer_block import FeedForward
 from .positional import SinusoidalPositionalEncoding
 
 
+def truncate_at_eos(tokens: list, eos_id: int, pad_id: int) -> list:
+    """Cuts a sequentially-decoded token list at its first <eos>/<pad>.
+    decode_greedy_sequential always returns max_len positions (padded after
+    each row's <eos>); scoring or displaying the raw row includes everything
+    after the model said 'stop', which is how val_ar_cer values above 1.0
+    (hypotheses longer than references) were produced."""
+    out = []
+    for t in tokens:
+        if t == eos_id or t == pad_id:
+            break
+        out.append(t)
+    return out
+
+
+def truncate_blocks(tokens: list, k: int, eob_id: int, pad_id: int, num_blocks: int = None) -> list:
+    """Assembles a blockwise-decoded token list into the real output: within
+    each K-token block, keep tokens up to the first <eob>/<pad> (the rest of
+    that block is padding, not content), then continue with the next block --
+    <eob> ends a block, not the line, and uniform splitting legitimately
+    produces empty middle blocks. `num_blocks` drops trailing blocks decoded
+    past a line's real chunk count (batched decode runs every line to the
+    batch max)."""
+    out = []
+    blocks = [tokens[i:i + k] for i in range(0, len(tokens), k)]
+    if num_blocks is not None:
+        blocks = blocks[:num_blocks]
+    for blk in blocks:
+        for t in blk:
+            if t == eob_id or t == pad_id:
+                break
+            out.append(t)
+    return out
+
+
 class DecoderLayer(nn.Module):
     def __init__(self, d_model: int, num_heads: int, ff_expansion: int = 4, dropout: float = 0.1):
         super().__init__()
@@ -74,13 +108,20 @@ class DecoderLayer(nn.Module):
 
 
 class BlockwiseARDecoder(nn.Module):
-    def __init__(self, cfg, vocab_size: int, bos_id: int, pad_id: int):
+    def __init__(self, cfg, vocab_size: int, bos_id: int, pad_id: int, eos_id: int = None, eob_id: int = None):
         super().__init__()
         self.d_model = cfg.d_model
         self.K = cfg.max_tokens_per_block
         self.vocab_size = vocab_size
         self.bos_id = bos_id
         self.pad_id = pad_id
+        # eos_id/eob_id carry no parameters, so checkpoints saved before they
+        # existed still load. eos_id enables decode_greedy_sequential's early
+        # stop; eob_id enables decode_greedy's post-<eob> commit masking. When
+        # None, both decodes fall back to the old (correct but wasteful /
+        # context-polluting) behavior.
+        self.eos_id = eos_id
+        self.eob_id = eob_id
 
         self.token_emb = nn.Embedding(vocab_size, cfg.d_model, padding_idx=pad_id)
         self.pos_enc = SinusoidalPositionalEncoding(cfg.d_model)
@@ -162,13 +203,20 @@ class BlockwiseARDecoder(nn.Module):
         """Ordinary one-token-at-a-time greedy decoding (recomputes the whole
         prefix each step -- same known v1 no-KV-cache simplification as
         decode_greedy). Returns (B, <=max_len) token ids, NOT including the
-        leading <bos>; caller truncates each sample at its first <eos>/<pad>."""
+        leading <bos>; caller truncates each sample at its first <eos>/<pad>
+        (see truncate_at_eos). Stops as soon as every row has emitted <eos>
+        (when eos_id is configured): without this it always ran the full
+        max_len=256 iterations -- measured as the dominant cost of the
+        periodic eval -- and the post-<eos> positions are garbage anyway.
+        Rows that finish early keep generating <pad> so the batch stays
+        rectangular."""
         b = enc_out.shape[0]
         device = enc_out.device
         t_enc = enc_out.shape[1]
         enc_len_mask = torch.arange(t_enc, device=device).unsqueeze(0) < enc_lengths.unsqueeze(1)
         cross_mask = enc_len_mask.unsqueeze(1).unsqueeze(1)
         generated = torch.full((b, 1), self.bos_id, dtype=torch.long, device=device)
+        finished = torch.zeros(b, dtype=torch.bool, device=device)
         for _ in range(max_len):
             l_dec = generated.shape[1]
             x = self.token_emb(generated) + self.pos_enc(l_dec).unsqueeze(0)
@@ -178,7 +226,12 @@ class BlockwiseARDecoder(nn.Module):
             x = self.ln_final(x)
             next_logits = self.token_head(x[:, -1, :])
             next_tok = next_logits.argmax(dim=-1, keepdim=True)
+            if self.eos_id is not None:
+                next_tok = next_tok.masked_fill(finished.unsqueeze(1), self.pad_id)
+                finished = finished | (next_tok.squeeze(1) == self.eos_id)
             generated = torch.cat([generated, next_tok], dim=1)
+            if self.eos_id is not None and bool(finished.all()):
+                break
         return generated[:, 1:]  # drop the leading <bos>
 
     @torch.no_grad()
@@ -199,6 +252,17 @@ class BlockwiseARDecoder(nn.Module):
             h = x[:, blk * self.K, :]
             block_logits = self.block_head(h).view(b, self.K, self.vocab_size)
             block_tokens = block_logits.argmax(dim=-1)  # (B,K)
+            if self.eob_id is not None:
+                # Slots after a block's first <eob>/<pad> were never supervised
+                # (their teacher-forcing targets are <pad>, excluded by the CE's
+                # ignore_index), so their argmax is noise. Committing that noise
+                # hands later blocks a context that training never produced --
+                # training always saw <pad> there. Mask to <pad> before
+                # committing so inference context matches the training layout.
+                # The <eob> itself IS supervised, so it stays.
+                ended = (block_tokens == self.eob_id) | (block_tokens == self.pad_id)
+                after_first_end = (ended.cumsum(dim=1) - ended.long()) > 0
+                block_tokens = block_tokens.masked_fill(after_first_end, self.pad_id)
             committed = torch.cat([committed, block_tokens], dim=1)
             blocks_out.append(block_tokens)
         return torch.cat(blocks_out, dim=1)

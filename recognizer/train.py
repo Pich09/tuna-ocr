@@ -46,6 +46,7 @@ from .data.dataset import (BucketBatchSampler, OCRLineDataset, compute_widths, m
 from .data.manifest import build_combined_index, load_dedup_manifest
 from .data.transforms import chunk_line_image
 from .hf_push import push_checkpoint
+from .modules.decoder import truncate_at_eos, truncate_blocks
 from .modules.model import Recognizer
 from .tokenizer.khmer_ocr_tokenizer import KhmerOcrTokenizer
 
@@ -178,34 +179,53 @@ def log_inference_samples(model, tokenizer, model_cfg, samples, device, logger, 
             sample.image_source, model_cfg.chunk_width, model_cfg.chunk_overlap, model_cfg.img_height,
         )
         chunk_batch = torch.stack(chunk_tensors).to(device)
-        chunks_per_line = torch.tensor([len(chunk_tensors)], dtype=torch.long, device=device)
+        chunks_per_line = torch.tensor([len(chunk_tensors)], dtype=torch.long)
         enc_out, enc_lengths, enc_block_ids = model.encode(chunk_batch, chunks_per_line)
         if mode == "sequential":
             tokens = model.decoder.decode_greedy_sequential(enc_out, enc_lengths)[0].tolist()
+            tokens = truncate_at_eos(tokens, tokenizer.eos_id, tokenizer.pad_id)
         else:
             max_blocks = min(len(chunk_tensors), 256 // max(1, model_cfg.max_tokens_per_block) + 1)
             tokens = model.decoder.decode_greedy(enc_out, enc_lengths, enc_block_ids, max_blocks)[0].tolist()
+            tokens = truncate_blocks(tokens, model_cfg.max_tokens_per_block,
+                                     tokenizer.eob_id, tokenizer.pad_id, num_blocks=len(chunk_tensors))
         pred = tokenizer.decode(tokens, strip_control=True)
         # CTC greedy is the encoder's own read-out: it is alignment-free and
         # not exposed to the decoder's exposure bias, so it is the earliest
         # honest signal that the encoder is learning to SEE text at all.
         ctc_txt = ""
         if char_vocab is not None:
-            ctc_ids = model.ctc_head(enc_out).argmax(-1)[0]
-            seq, prev = [], -1
-            for t in range(int(enc_lengths[0])):
-                c = int(ctc_ids[t])
-                if c != prev and c != char_vocab.blank_id:
-                    seq.append(c)
-                prev = c
-            ctc_txt = char_vocab.decode(seq)
+            # One device->host transfer for the whole row -- indexing the GPU
+            # tensor per frame costs a sync per frame.
+            n = int(enc_lengths[0])
+            row = model.ctc_head(enc_out).argmax(-1)[0][:n].cpu().tolist()
+            ctc_txt = char_vocab.decode(_collapse_ctc(row, char_vocab.blank_id))
         logger.info(f"  [sample {i}] step {step} gt={sample.text!r} ctc={ctc_txt!r} ar={pred!r}")
     if was_training:
         model.train()
 
 
+def _collapse_ctc(row: list, blank_id: int) -> list:
+    """Standard CTC greedy post-processing: collapse repeats, drop blanks."""
+    out, prev = [], None
+    for c in row:
+        if c != prev and c != blank_id:
+            out.append(c)
+        prev = c
+    return out
+
+
+def _scaled_width(sample, img_height: int) -> int:
+    """Width the line will have after the fixed-height resize -- what actually
+    determines its chunk count (see data/dataset.py's compute_widths)."""
+    from .data.transforms import open_image  # noqa: PLC0415
+    with open_image(sample.image_source) as img:
+        w, h = img.size
+    return max(1, round(w * img_height / max(1, h)))
+
+
 def evaluate_val_cer(model, tokenizer, model_cfg, val_samples, device, char_vocab, mode: str = "blockwise",
-                     ar_limit: int = None):
+                     ar_limit: int = None, batch_size: int = 16):
     """Greedy-decodes held-out samples and returns
     (ar_cer, ctc_cer, n_ar, n_ctc) -- real quantitative numbers to track
     alongside the loss (loss can keep falling on train while val CER climbs;
@@ -214,16 +234,23 @@ def evaluate_val_cer(model, tokenizer, model_cfg, val_samples, device, char_voca
     restores train mode on exit; no grad.
 
     The two metrics are priced very differently and so are sampled
-    differently. Both share one `model.encode` per sample, but the CTC
-    read-out is then just an argmax over that output, while the AR read-out
-    is a full greedy decode -- and in "sequential" mode that emits ONE TOKEN
-    PER FORWARD PASS. Measured on CUDA: ~1072 ms/sample sequential against
-    ~26 ms/sample blockwise, so on a real run the AR decode was 100% of a
-    10.7-minute eval that ran every 500 steps -- 71% of total wall clock,
-    spent re-confirming a number that moves slowly. `ar_limit` therefore
-    caps the AR decode at the first N samples while CTC CER still covers all
-    of `val_samples`; the returned counts say what each number was measured
-    over, so a small-n AR CER is never mistaken for a full-set one."""
+    differently: the CTC read-out is an argmax over an encoder pass, while
+    the AR read-out is a full greedy decode -- in "sequential" mode one
+    token per forward pass. `ar_limit` caps the AR decode at the FIRST N
+    samples (a fixed subset, so the CER curve tracks the model, not the
+    draw) while CTC CER covers all of `val_samples`; the returned counts say
+    what each number was measured over.
+
+    Decoding is batched (`batch_size` lines per encoder pass, sorted by
+    scaled width within each metric's pool to limit padding -- CER over a
+    set is order-independent, so sorting is free) and every hypothesis is
+    truncated at its real end: sequential rows at their first <eos>/<pad>,
+    blockwise rows per block at <eob>/<pad> and at the line's own block
+    count. batch_size=16, not larger: the sequential decode's cross-attention
+    grows with batch x prefix x encoder frames, and at 32 the widest-line
+    batches thrashed a 4GB GPU (188s vs 37s at 16 for the same 64 samples). Without the truncation, hypotheses carried up to max_len=256
+    tokens of post-<eos> garbage -- the source of the impossible val_ar_cer
+    values above 1.0 in earlier runs."""
     import editdistance  # noqa: PLC0415 -- kept local so training without eval has no hard dep
 
     def cer(refs, hyps):
@@ -232,38 +259,60 @@ def evaluate_val_cer(model, tokenizer, model_cfg, val_samples, device, char_voca
         edits = sum(editdistance.eval(r, h) for r, h in zip(refs, hyps))
         return edits / (sum(len(r) for r in refs) or 1)
 
+    def encode_batch(batch_samples):
+        all_chunks, cpl = [], []
+        for s in batch_samples:
+            ct, _ = chunk_line_image(
+                s.image_source, model_cfg.chunk_width, model_cfg.chunk_overlap, model_cfg.img_height)
+            all_chunks.extend(ct)
+            cpl.append(len(ct))
+        chunk_batch = torch.stack(all_chunks).to(device)
+        # host tensor on purpose -- the encoder only reads this via .tolist();
+        # see data/dataset.py's HOST_ONLY_BATCH_KEYS.
+        enc = model.encode(chunk_batch, torch.tensor(cpl, dtype=torch.long))
+        return enc, cpl
+
+    def batches(sample_list):
+        ordered = sorted(sample_list, key=lambda s: _scaled_width(s, model_cfg.img_height))
+        for i in range(0, len(ordered), batch_size):
+            yield ordered[i:i + batch_size]
+
     was_training = model.training
     model.eval()
-    ar_refs, ar_hyps, ctc_refs, ctc_hyps = [], [], [], []
-    with torch.no_grad():
-        for i, sample in enumerate(val_samples):
-            chunk_tensors, _ = chunk_line_image(
-                sample.image_source, model_cfg.chunk_width, model_cfg.chunk_overlap, model_cfg.img_height,
-            )
-            chunk_batch = torch.stack(chunk_tensors).to(device)
-            # host tensor on purpose -- the encoder only reads this via .tolist()
-            # for Python control flow; see data/dataset.py's HOST_ONLY_BATCH_KEYS.
-            chunks_per_line = torch.tensor([len(chunk_tensors)], dtype=torch.long)
-            enc_out, enc_lengths, enc_block_ids = model.encode(chunk_batch, chunks_per_line)
 
-            if ar_limit is None or i < ar_limit:
-                if mode == "sequential":
-                    tokens = model.decoder.decode_greedy_sequential(enc_out, enc_lengths)[0].tolist()
-                else:
-                    max_blocks = min(len(chunk_tensors), 256 // max(1, model_cfg.max_tokens_per_block) + 1)
-                    tokens = model.decoder.decode_greedy(enc_out, enc_lengths, enc_block_ids, max_blocks)[0].tolist()
+    ctc_refs, ctc_hyps = [], []
+    ar_refs, ar_hyps = [], []
+    ar_samples = list(val_samples) if ar_limit is None else list(val_samples[:ar_limit])
+
+    with torch.no_grad():
+        # CTC CER over the full pool: argmax + collapse, one transfer per batch.
+        for group in batches(val_samples):
+            (enc_out, enc_lengths, _), _ = encode_batch(group)
+            ids = model.ctc_head(enc_out).argmax(-1).cpu()
+            lengths = enc_lengths.cpu().tolist()
+            for sample, row, n in zip(group, ids.tolist(), lengths):
+                ctc_refs.append(sample.text)
+                ctc_hyps.append(char_vocab.decode(_collapse_ctc(row[:n], char_vocab.blank_id)))
+
+        # AR CER over the capped pool (re-encodes those lines; the encoder
+        # pass is ~26ms/sample, noise next to the decode it feeds).
+        for group in batches(ar_samples):
+            (enc_out, enc_lengths, enc_block_ids), cpl = encode_batch(group)
+            if mode == "sequential":
+                rows = model.decoder.decode_greedy_sequential(enc_out, enc_lengths).tolist()
+                trimmed = [truncate_at_eos(r, tokenizer.eos_id, tokenizer.pad_id) for r in rows]
+            else:
+                max_blocks = min(max(cpl), 256 // max(1, model_cfg.max_tokens_per_block) + 1)
+                rows = model.decoder.decode_greedy(enc_out, enc_lengths, enc_block_ids, max_blocks).tolist()
+                trimmed = [
+                    truncate_blocks(r, model_cfg.max_tokens_per_block, tokenizer.eob_id,
+                                    tokenizer.pad_id, num_blocks=n)
+                    for r, n in zip(rows, cpl)
+                ]
+            for sample, tokens in zip(group, trimmed):
                 ar_refs.append(sample.text)
                 ar_hyps.append(tokenizer.decode(tokens, strip_control=True))
 
-            ctc_ids = model.ctc_head(enc_out).argmax(-1)[0]
-            seq, prev = [], -1
-            for t in range(int(enc_lengths[0])):
-                c = int(ctc_ids[t])
-                if c != prev and c != char_vocab.blank_id:
-                    seq.append(c)
-                prev = c
-            ctc_refs.append(sample.text)
-            ctc_hyps.append(char_vocab.decode(seq))
     if was_training:
         model.train()
     return cer(ar_refs, ar_hyps), cer(ctc_refs, ctc_hyps), len(ar_refs), len(ctc_refs)
@@ -362,7 +411,8 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
 
     print(f"run_training: building model + moving to {device}...", flush=True)
     model = Recognizer(model_cfg, tokenizer.vocab_size, bos_id=tokenizer.bos_id,
-                       pad_id=tokenizer.pad_id, ctc_vocab_size=char_vocab.size).to(device)
+                       pad_id=tokenizer.pad_id, ctc_vocab_size=char_vocab.size,
+                       eos_id=tokenizer.eos_id, eob_id=tokenizer.eob_id).to(device)
 
     ckpt_dir = ckpt_dir_early
     logger = build_logger(ckpt_dir, run_name)

@@ -82,11 +82,21 @@ class OCRLineDataset(Dataset):
         return len(self.samples)
 
     def image_width(self, idx: int) -> int:
-        """Cheap width lookup (PIL lazy header read, no full pixel decode)
-        used by BucketBatchSampler -- proxy for num_chunks without paying
-        for the actual chunking pass."""
+        """Cheap SCALED-width lookup (PIL lazy header read, no full pixel
+        decode) used by BucketBatchSampler and the OOM probe -- proxy for
+        num_chunks without paying for the actual chunking pass.
+
+        Scaled (w * img_height / h), not raw: every line is resized to a
+        fixed height before chunking, so the post-resize width is what
+        actually sets its chunk count and memory footprint. The data's
+        heights span 32-1024px, and ranking by raw width mis-orders badly
+        across that range (measured: the top-64 by raw vs scaled width only
+        overlap 42/64) -- raw-width bucketing mixed different chunk counts
+        into one batch (pad waste), and the OOM probe's "widest batch" was
+        only the true worst-case batch by luck, not construction."""
         with open_image(self.samples[idx].image_source) as img:
-            return img.size[0]
+            w, h = img.size
+        return max(1, round(w * self.cfg.img_height / max(1, h)))
 
     def __getitem__(self, idx):
         sample = self.samples[idx]
@@ -162,7 +172,10 @@ def make_collate_fn(tokenizer, chunk_width: int):
 # which on XLA/TPU serializes the whole asynchronous execution pipeline (the
 # graph must run to completion before the loop can even decide its shapes) and
 # on CUDA costs a needless stall. Keeping it on the CPU makes those reads free.
-HOST_ONLY_BATCH_KEYS = frozenset({"chunks_per_line"})
+# valid_widths is carried in the batch for future use (per-chunk real pixel
+# width before padding) but consumed by no layer today -- shipping it to the
+# accelerator every step was pure transfer waste.
+HOST_ONLY_BATCH_KEYS = frozenset({"chunks_per_line", "valid_widths"})
 
 
 def move_batch(batch: dict, device) -> dict:
@@ -251,7 +264,10 @@ def compute_widths(dataset: "OCRLineDataset", num_workers: int = 32, cache_path:
 
     key = None
     if cache_path is not None and len(dataset) > 0:
-        key = (f"{len(dataset)}|{_sample_key(dataset.samples[0])}|"
+        # "v2": versions the formula, not just the data -- v1 cached RAW pixel
+        # widths; image_width now returns scaled width, so a v1 cache would be
+        # silently wrong for bucketing/probing if reused.
+        key = (f"v2|{len(dataset)}|{_sample_key(dataset.samples[0])}|"
                f"{_sample_key(dataset.samples[-1])}")
         try:
             with open(cache_path, encoding="utf-8") as f:
