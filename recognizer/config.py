@@ -43,7 +43,15 @@ class TrainConfig:
     log_every: int = 100
     ckpt_every: int = 10_000
     sample_every: int = 500
-    eval_every: int = 500  # full held-out val CER (AR + CTC) every N steps; 0 disables
+    eval_every: int = 500  # held-out val CER (AR + CTC) every N steps; 0 disables
+    # Cap on how many val samples the PERIODIC eval decodes. evaluate_val_cer
+    # decodes one sample at a time, and in sequential-AR mode emits one token
+    # per forward pass -- measured at 1072 ms/sample on CUDA, i.e. 153 minutes
+    # for the full 8578-sample val set of the production dataset, every
+    # eval_every steps. That is not a metric, it is a stall (and it is what an
+    # earlier run's "stuck for hours at step 1000" turned out to be). A few
+    # hundred samples give a perfectly usable CER estimate; set 0 for no cap.
+    max_eval_samples: int = 512
     num_samples: int = 3
     num_workers: int = 8
     seed: int = 0

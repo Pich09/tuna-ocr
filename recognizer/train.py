@@ -42,7 +42,7 @@ from . import env_utils
 from .config import ModelConfig, TrainConfig, DEFAULT_CHECKPOINT_ROOT, TOKENIZER_ASSETS_DIR
 from .data.char_vocab import CharVocab, build_char_vocab
 from .data.dataset import (BucketBatchSampler, OCRLineDataset, compute_widths, make_collate_fn,
-                           move_batch)
+                           move_batch, truncation_stats)
 from .data.manifest import build_combined_index, load_dedup_manifest
 from .data.transforms import chunk_line_image
 from .hf_push import push_checkpoint
@@ -294,6 +294,11 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
     # whole run -- otherwise a changing sample set would confound "is this
     # getting more readable" with "is this a different, easier/harder line".
     inference_samples = val_samples[:train_cfg.num_samples]
+    # Head slice, not a re-sample: val_samples is already shuffled, so the head
+    # is an unbiased draw across sources, and holding it FIXED means the CER
+    # curve tracks the model rather than which lines happened to be drawn.
+    eval_samples = (val_samples[:train_cfg.max_eval_samples]
+                    if train_cfg.max_eval_samples else val_samples)
 
     ckpt_dir_early = Path(checkpoint_root) / run_name
     ckpt_dir_early.mkdir(parents=True, exist_ok=True)
@@ -463,12 +468,18 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
                 log_inference_samples(model, tokenizer, model_cfg, inference_samples, device, logger, step,
                                       char_vocab=char_vocab, mode=ar_mode)
 
-            if train_cfg.eval_every > 0 and step % train_cfg.eval_every == 0 and val_samples:
+            if train_cfg.eval_every > 0 and step % train_cfg.eval_every == 0 and eval_samples:
+                t_eval = time.time()
                 ar_cer, ctc_cer = evaluate_val_cer(
-                    model, tokenizer, model_cfg, val_samples, device, char_vocab, mode=ar_mode)
+                    model, tokenizer, model_cfg, eval_samples, device, char_vocab, mode=ar_mode)
                 epoch = step / steps_per_epoch
                 logger.info(f"eval step {step} epoch {epoch:.2f} val_ar_cer {ar_cer:.4f} "
-                            f"val_ctc_cer {ctc_cer:.4f} (n={len(val_samples)})")
+                            f"val_ctc_cer {ctc_cer:.4f} (n={len(eval_samples)} of {len(val_samples)} "
+                            f"held out, {time.time() - t_eval:.1f}s)")
+                trunc = truncation_stats()
+                if trunc:
+                    logger.info("AR block truncation so far: " + ", ".join(
+                        f"{src}: {n} blocks / {dropped} tokens dropped" for src, (n, dropped) in trunc.items()))
                 with eval_log_path.open("a", newline="") as f:
                     csv.writer(f).writerow([step, f"{epoch:.4f}", f"{ar_cer:.4f}", f"{ctc_cer:.4f}"])
 
@@ -520,8 +531,12 @@ def main():
                               "ground truth, as a readability sanity check alongside the loss numbers. "
                               "0 disables.")
     parser.add_argument("--eval-every", type=int, default=None,
-                         help="Compute quantitative held-out val CER (AR + CTC) over the whole val set "
-                              "every N steps, logged to train.log and eval_log.csv. 0 disables.")
+                         help="Compute quantitative held-out val CER (AR + CTC) every N steps, logged to "
+                              "train.log and eval_log.csv. 0 disables.")
+    parser.add_argument("--max-eval-samples", type=int, default=None,
+                         help="Cap on val samples decoded per periodic eval (default 512). The full val "
+                              "set is thousands of samples decoded one at a time, which at production "
+                              "scale takes hours per eval; 0 means no cap.")
     parser.add_argument("--num-workers", type=int, default=None,
                          help="DataLoader worker processes for image loading/decoding. 0 = synchronous "
                               "(main process only) -- keep >0 to avoid GPU idling on CPU-bound decode.")
@@ -553,6 +568,8 @@ def main():
         train_cfg.ckpt_every = args.ckpt_every
     if args.sample_every is not None:
         train_cfg.sample_every = args.sample_every
+    if args.max_eval_samples is not None:
+        train_cfg.max_eval_samples = args.max_eval_samples
     if args.eval_every is not None:
         train_cfg.eval_every = args.eval_every
     if args.num_workers is not None:

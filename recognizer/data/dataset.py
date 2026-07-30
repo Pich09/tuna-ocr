@@ -15,6 +15,23 @@ from torch.utils.data import Dataset, Sampler
 
 from .transforms import chunk_line_image, open_image
 
+# Per-source tally of block truncations, so the (common, expected) event is
+# reported as one warning plus a running count instead of one warning per
+# affected sample. The message text used to embed the offending token count,
+# which made every occurrence textually unique -- defeating warnings' built-in
+# dedup and emitting an unbounded stream into the notebook. At ~6% of samples
+# that is one or two warnings per batch forever, which buries the training log
+# and can take a Colab kernel down through sheer output volume.
+_TRUNCATION_COUNTS = {}
+_TRUNCATION_DROPPED = {}
+
+
+def truncation_stats() -> dict:
+    """{source: (num_blocks_truncated, num_tokens_dropped)} accumulated so far.
+    Logged periodically by train.py -- this is real supervision being thrown
+    away, so it belongs in the training log as a number, not as log spam."""
+    return {s: (_TRUNCATION_COUNTS[s], _TRUNCATION_DROPPED.get(s, 0)) for s in _TRUNCATION_COUNTS}
+
 
 def split_into_blocks(token_ids: list, num_blocks: int, max_tokens_per_block: int, eob_id: int, pad_id: int, source: str = "") -> list:
     """Uniform-interval split of `token_ids` into `num_blocks` contiguous
@@ -30,11 +47,19 @@ def split_into_blocks(token_ids: list, num_blocks: int, max_tokens_per_block: in
         run = token_ids[idx: idx + size]
         idx += size
         if len(run) > max_tokens_per_block:
-            warnings.warn(
-                f"[{source}] block {i} has {len(run)} tokens > max_tokens_per_block="
-                f"{max_tokens_per_block}; truncating (known v1 limitation of uniform "
-                f"block splitting -- see recognizer plan Step 3)."
-            )
+            first = source not in _TRUNCATION_COUNTS
+            _TRUNCATION_COUNTS[source] = _TRUNCATION_COUNTS.get(source, 0) + 1
+            _TRUNCATION_DROPPED[source] = (_TRUNCATION_DROPPED.get(source, 0)
+                                           + len(run) - max_tokens_per_block)
+            if first:
+                # Once per source, with a stable message so warnings' own dedup
+                # holds even if this is ever reached from several call sites.
+                warnings.warn(
+                    f"[{source}] AR block targets exceed max_tokens_per_block="
+                    f"{max_tokens_per_block} and are being truncated (known v1 limitation "
+                    f"of uniform block splitting -- see recognizer plan Step 3). Further "
+                    f"occurrences are counted, not warned; see dataset.truncation_stats()."
+                )
             run = run[:max_tokens_per_block]
         if len(run) < max_tokens_per_block:
             run = run + [eob_id] + [pad_id] * (max_tokens_per_block - len(run) - 1)

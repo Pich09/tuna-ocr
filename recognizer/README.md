@@ -117,6 +117,40 @@ Loss is hybrid CTC (auxiliary, over the full non-windowed encoder output,
 left-to-right monotonic image/text correspondence the block-restricted
 cross-attention depends on.
 
+### Periodic eval is capped (`max_eval_samples`)
+
+`evaluate_val_cer` decodes val samples **one at a time**, and in
+sequential-AR mode emits one token per forward pass. Measured on CUDA:
+1072 ms/sample sequential vs 26 ms/sample blockwise. At production scale
+(`val_frac=0.02` of 428,911 samples = 8,578 held out) an uncapped
+sequential eval is ~153 minutes -- *every* `eval_every=500` steps. That is
+not a metric, it is a stall, and it is what an earlier run's "stuck for
+hours at step 1000" turned out to be.
+
+So the periodic eval decodes at most `TrainConfig.max_eval_samples=512` of
+them (`--max-eval-samples`, `0` = no cap). It's a fixed head slice of the
+already-shuffled val list, so it's an unbiased draw across sources and
+stays constant across the run -- the CER curve tracks the model, not which
+lines were drawn. The eval log line reports both the cap and the wall time
+(`n=512 of 8578 held out, 3.4s`).
+
+### AR block truncation is counted, not warned per sample
+
+The uniform block split can hand a block more tokens than
+`max_tokens_per_block=8`, and the excess is dropped. On the production
+dataset this hits ~5.7% of samples and drops ~12.9% of all AR tokens,
+essentially all of it from `sokheng_synthetic_v1` (25.6% of that source),
+whose worst cases pair a 1-chunk image with a 50+ token transcript -- i.e.
+upstream label noise, not a tuning problem.
+
+`split_into_blocks` warns **once per source** and accumulates the rest into
+`dataset.truncation_stats()`, which `train.py` logs alongside each eval.
+The message deliberately carries no per-sample numbers: it used to embed
+the token count, making every occurrence textually unique, which defeated
+`warnings`' own dedup and emitted one warning per affected sample --
+enough output to bury the training log and, at Colab's output limits, take
+the kernel down with it.
+
 ### Logging, checkpoints, resuming
 
 Every `log_every=100` steps, `run_training` reports `step, epoch, loss,
