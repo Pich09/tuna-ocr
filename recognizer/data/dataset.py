@@ -6,6 +6,7 @@ alignment, each sample's tagged token sequence is uniform-split into
 `num_chunks` runs for teacher forcing (Step 3's documented approximation).
 """
 import json
+import math
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -171,6 +172,54 @@ def move_batch(batch: dict, device) -> dict:
         k: (v.to(device) if torch.is_tensor(v) and k not in HOST_ONLY_BATCH_KEYS else v)
         for k, v in batch.items()
     }
+
+
+def encoder_frames_for(width: int, height: int, cfg) -> int:
+    """How many encoder frames a line image of `width` x `height` yields --
+    the hard ceiling on how many labels CTC can emit for it.
+
+    Mirrors the real pipeline: resize to cfg.img_height preserving aspect,
+    slice into cfg.chunk_width chunks overlapping by cfg.chunk_overlap, and
+    subsample 4x in the conv frontend, trimming each non-first chunk's
+    overlap-derived leading frames (see ConformerEncoder.overlap_frames).
+    Derived from the image header alone -- no pixel decode.
+    """
+    scaled_w = max(1, round(width * cfg.img_height / max(1, height)))
+    stride = cfg.chunk_width - cfg.chunk_overlap
+    n_chunks = max(1, math.ceil(max(0, scaled_w - cfg.chunk_overlap) / stride))
+    per_chunk = cfg.chunk_width // 4
+    overlap_frames = math.ceil(cfg.chunk_overlap / 4)
+    return n_chunks * per_chunk - (n_chunks - 1) * overlap_frames
+
+
+def find_unlearnable(samples: list, cfg, char_vocab, num_workers: int = 32) -> list:
+    """Indices of samples whose CTC target is longer than the encoder frames
+    their image can produce.
+
+    CTC cannot emit more labels than it has input frames, so for these the
+    loss is +inf -- and `compute_loss` passes zero_infinity=True, which
+    replaces that with 0. The sample then contributes NO gradient, silently,
+    for the entire run. Measured on the production dataset: 5.3% of samples,
+    23.5% of sokheng_synthetic_v1 and 0.0% of every other source, with the
+    worst pairing 124 target characters against 32 frames from a single
+    128px chunk. That is upstream label noise (transcript doesn't match the
+    image), not something a hyperparameter can fix.
+
+    Only the image header is read, so this is a fast threaded scan rather
+    than a decode of every image.
+    """
+    def is_bad(i):
+        s = samples[i]
+        try:
+            with open_image(s.image_source) as img:
+                w, h = img.size
+        except Exception:
+            return False  # unreadable is a different problem; don't silently drop it here
+        return len(char_vocab.encode(s.text)) > encoder_frames_for(w, h, cfg)
+
+    with ThreadPoolExecutor(max_workers=num_workers) as pool:
+        flags = list(pool.map(is_bad, range(len(samples))))
+    return [i for i, bad in enumerate(flags) if bad]
 
 
 def compute_widths(dataset: "OCRLineDataset", num_workers: int = 32, cache_path: Path = None) -> list:

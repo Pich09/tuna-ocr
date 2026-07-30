@@ -42,7 +42,7 @@ from . import env_utils
 from .config import ModelConfig, TrainConfig, DEFAULT_CHECKPOINT_ROOT, TOKENIZER_ASSETS_DIR
 from .data.char_vocab import CharVocab, build_char_vocab
 from .data.dataset import (BucketBatchSampler, OCRLineDataset, compute_widths, make_collate_fn,
-                           move_batch, truncation_stats)
+                           find_unlearnable, move_batch, truncation_stats)
 from .data.manifest import build_combined_index, load_dedup_manifest
 from .data.transforms import chunk_line_image
 from .hf_push import push_checkpoint
@@ -311,15 +311,6 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
     random.Random(train_cfg.seed).shuffle(samples)
     n_val = max(1, int(len(samples) * train_cfg.val_frac))
     train_samples, val_samples = samples[n_val:], samples[:n_val]
-    # fixed subset (not re-sampled) so the same lines are tracked across the
-    # whole run -- otherwise a changing sample set would confound "is this
-    # getting more readable" with "is this a different, easier/harder line".
-    inference_samples = val_samples[:train_cfg.num_samples]
-    # Head slice, not a re-sample: val_samples is already shuffled, so the head
-    # is an unbiased draw across sources, and holding it FIXED means the CER
-    # curve tracks the model rather than which lines happened to be drawn.
-    eval_samples = (val_samples[:train_cfg.max_eval_samples]
-                    if train_cfg.max_eval_samples else val_samples)
 
     ckpt_dir_early = Path(checkpoint_root) / run_name
     ckpt_dir_early.mkdir(parents=True, exist_ok=True)
@@ -330,6 +321,41 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
     else:
         char_vocab = build_char_vocab((s.text for s in train_samples), min_count=2)
         char_vocab.save(char_vocab_path)
+
+    # Drop samples CTC provably cannot fit (target longer than the encoder
+    # frames the image yields). Their loss is +inf, which zero_infinity=True
+    # turns into 0, so they contribute nothing but still cost a forward pass --
+    # and in sequential-AR mode the decoder is meanwhile taught to emit their
+    # full impossible transcript, which is worse than nothing. Runs after the
+    # split so train/val stay disjoint, and on both so val CER isn't inflated
+    # by lines no model could get right.
+    if train_cfg.filter_unlearnable:
+        print("run_training: scanning for unlearnable samples (CTC target > encoder frames)...", flush=True)
+        t_f = time.time()
+        n_before = len(train_samples), len(val_samples)
+        dropped_by_source = {}
+        for name, lst in (("train", train_samples), ("val", val_samples)):
+            bad = set(find_unlearnable(lst, model_cfg, char_vocab))
+            for i in bad:
+                src = lst[i].source
+                dropped_by_source[src] = dropped_by_source.get(src, 0) + 1
+            lst[:] = [s for i, s in enumerate(lst) if i not in bad]
+        print(f"run_training: dropped {n_before[0] - len(train_samples)} train / "
+              f"{n_before[1] - len(val_samples)} val unlearnable samples in {time.time() - t_f:.1f}s "
+              f"({dropped_by_source or 'none'})", flush=True)
+        if not train_samples:
+            raise RuntimeError("Every training sample was filtered as unlearnable -- check "
+                               "model_cfg.chunk_width/img_height against your data before rerunning.")
+
+    # fixed subset (not re-sampled) so the same lines are tracked across the
+    # whole run -- otherwise a changing sample set would confound "is this
+    # getting more readable" with "is this a different, easier/harder line".
+    inference_samples = val_samples[:train_cfg.num_samples]
+    # Head slice, not a re-sample: val_samples is already shuffled, so the head
+    # is an unbiased draw across sources, and holding it FIXED means the CER
+    # curve tracks the model rather than which lines happened to be drawn.
+    eval_samples = (val_samples[:train_cfg.max_eval_samples]
+                    if train_cfg.max_eval_samples else val_samples)
 
     train_ds = OCRLineDataset(train_samples, tokenizer, model_cfg, char_vocab=char_vocab)
     collate_fn = make_collate_fn(tokenizer, model_cfg.chunk_width)
@@ -555,6 +581,10 @@ def main():
     parser.add_argument("--eval-every", type=int, default=None,
                          help="Compute quantitative held-out val CER (AR + CTC) every N steps, logged to "
                               "train.log and eval_log.csv. 0 disables.")
+    parser.add_argument("--keep-unlearnable", action="store_true",
+                         help="Keep samples whose CTC target is longer than the encoder frames their "
+                              "image yields. Those have ctc_loss=+inf, zeroed by zero_infinity, so they "
+                              "contribute no gradient; they are dropped by default.")
     parser.add_argument("--max-ar-eval-samples", type=int, default=None,
                          help="Cap on the AR greedy decode inside each periodic eval (default 64). The "
                               "AR decode dominates eval cost (~1072 ms/sample in sequential mode vs ~26 "
@@ -598,6 +628,8 @@ def main():
         train_cfg.max_eval_samples = args.max_eval_samples
     if args.max_ar_eval_samples is not None:
         train_cfg.max_ar_eval_samples = args.max_ar_eval_samples
+    if args.keep_unlearnable:
+        train_cfg.filter_unlearnable = False
     if args.eval_every is not None:
         train_cfg.eval_every = args.eval_every
     if args.num_workers is not None:

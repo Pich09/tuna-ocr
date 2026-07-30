@@ -61,6 +61,14 @@ class TrainConfig:
     # letting it own the run. 0 disables the AR decode during periodic eval
     # entirely (CTC CER only); None means no cap.
     max_ar_eval_samples: int = 64
+    # Drop samples whose CTC target is longer than the encoder frames their
+    # image can produce. CTC cannot emit more labels than it has frames, so the
+    # loss is +inf, and compute_loss's zero_infinity=True silently turns that
+    # into 0 -- the sample contributes no gradient at all, forever, while still
+    # costing a forward pass. Measured on the production dataset: 5.3% overall,
+    # 23.5% of sokheng_synthetic_v1 and 0.0% of every other source. Set False
+    # (--keep-unlearnable) to train on them anyway.
+    filter_unlearnable: bool = True
     num_samples: int = 3
     num_workers: int = 8
     seed: int = 0

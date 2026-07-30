@@ -155,6 +155,39 @@ wall time, so a small-n AR CER is never mistaken for a full-set one:
 eval step 500 ... val_ar_cer 0.9742 (n=64) val_ctc_cer 0.9574 (n=512 of 8578 held out) [81.2s]
 ```
 
+### Unlearnable samples are filtered (`filter_unlearnable`)
+
+CTC cannot emit more labels than it has input frames. When a sample's target
+is longer, `F.ctc_loss` returns `+inf` -- and `compute_loss` passes
+`zero_infinity=True`, which replaces that with `0`. The sample then
+contributes **no gradient at all**, silently, for the whole run, while still
+costing a forward pass. Nothing in the loss curve reveals it.
+
+Measured on the production dataset (3,000-sample scan):
+
+```
+samples where CTC target length exceeds encoder frames: 158/3000 (5.3%)
+
+  deepcopy_khmer_text_recognition     0/903   ( 0.0%)
+  darayut_scene_text                  0/737   ( 0.0%)
+  chanrith_ocr_image_line             0/687   ( 0.0%)
+  sokheng_synthetic_v1              158/673  (23.5%)
+
+worst: 124 target chars against 32 encoder frames from a single 128px chunk
+```
+
+`run_training` drops these by default (`--keep-unlearnable` to disable),
+after the train/val split so the two stay disjoint, and from **both** so val
+CER isn't inflated by lines no model could get right. The scan is
+`find_unlearnable`, which reads only image headers -- ~20s over 428k samples.
+`encoder_frames_for(width, height, cfg)` derives the frame count from the
+header alone; it's verified exact against the real `chunk_line_image`
+pipeline on 1,500 real samples.
+
+Note this is the same upstream label noise as the truncation below, hitting
+a different mechanism: those transcripts don't match their images, so the AR
+path over-generates and the CTC path silently zeroes out.
+
 ### AR block truncation is counted, not warned per sample
 
 The uniform block split can hand a block more tokens than
