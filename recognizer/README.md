@@ -127,12 +127,33 @@ sequential eval is ~153 minutes -- *every* `eval_every=500` steps. That is
 not a metric, it is a stall, and it is what an earlier run's "stuck for
 hours at step 1000" turned out to be.
 
-So the periodic eval decodes at most `TrainConfig.max_eval_samples=512` of
-them (`--max-eval-samples`, `0` = no cap). It's a fixed head slice of the
-already-shuffled val list, so it's an unbiased draw across sources and
-stays constant across the run -- the CER curve tracks the model, not which
-lines were drawn. The eval log line reports both the cap and the wall time
-(`n=512 of 8578 held out, 3.4s`).
+The two metrics share one `model.encode` per sample but are priced very
+differently after that: CTC CER is an argmax over that output, while AR CER
+is a full greedy decode. So they get **separate caps**:
+
+| Knob | Default | Covers |
+|---|---|---|
+| `max_eval_samples` (`--max-eval-samples`) | 512 | both metrics' sample pool; `0` = whole val set |
+| `max_ar_eval_samples` (`--max-ar-eval-samples`) | 64 | the AR greedy decode only; `0` = CTC CER only |
+
+Measured on CUDA over a 512-sample slice, sequential mode:
+
+```
+ar_limit=None (all 512)   380.4s   n_ar=512  ctc_cer=1.0406
+ar_limit=64                48.1s   n_ar= 64  ctc_cer=1.0406   <- default
+ar_limit=0 (CTC only)       5.8s   n_ar=  0  ctc_cer=1.0406
+```
+
+CTC CER is identical in all three -- it always covers the full
+`max_eval_samples` pool; only the AR decode is subsampled. Both are fixed
+head slices of the already-shuffled val list, so they're unbiased across
+sources and constant across the run: the CER curve tracks the model, not
+which lines were drawn. The log line reports each metric's own `n` plus the
+wall time, so a small-n AR CER is never mistaken for a full-set one:
+
+```
+eval step 500 ... val_ar_cer 0.9742 (n=64) val_ctc_cer 0.9574 (n=512 of 8578 held out) [81.2s]
+```
 
 ### AR block truncation is counted, not warned per sample
 

@@ -52,6 +52,15 @@ class TrainConfig:
     # earlier run's "stuck for hours at step 1000" turned out to be). A few
     # hundred samples give a perfectly usable CER estimate; set 0 for no cap.
     max_eval_samples: int = 512
+    # Separate, much smaller cap on the AR greedy decode inside that eval. The
+    # CTC read-out is an argmax over an encoder pass the AR decode already
+    # needed, so it is nearly free across all max_eval_samples; the AR decode
+    # is not, and in sequential mode is ~40x slower still. Measured on a real
+    # run: 512 AR decodes = 639s (10.7 min) every 500 steps, against 265s of
+    # actual training -- 71% of wall clock. 64 keeps the AR signal without
+    # letting it own the run. 0 disables the AR decode during periodic eval
+    # entirely (CTC CER only); None means no cap.
+    max_ar_eval_samples: int = 64
     num_samples: int = 3
     num_workers: int = 8
     seed: int = 0

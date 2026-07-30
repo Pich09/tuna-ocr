@@ -204,37 +204,57 @@ def log_inference_samples(model, tokenizer, model_cfg, samples, device, logger, 
         model.train()
 
 
-def evaluate_val_cer(model, tokenizer, model_cfg, val_samples, device, char_vocab, mode: str = "blockwise"):
-    """Greedy-decodes the whole held-out val set and returns (ar_cer, ctc_cer)
-    -- a real quantitative performance number to track alongside the loss
-    (loss can keep falling on train while val CER climbs; that gap is the
-    overfitting signal). AR CER is the decoder's read-out, CTC CER the
-    encoder's alignment-free read-out. Runs in eval mode, restores train
-    mode on exit; no grad."""
+def evaluate_val_cer(model, tokenizer, model_cfg, val_samples, device, char_vocab, mode: str = "blockwise",
+                     ar_limit: int = None):
+    """Greedy-decodes held-out samples and returns
+    (ar_cer, ctc_cer, n_ar, n_ctc) -- real quantitative numbers to track
+    alongside the loss (loss can keep falling on train while val CER climbs;
+    that gap is the overfitting signal). AR CER is the decoder's read-out,
+    CTC CER the encoder's alignment-free read-out. Runs in eval mode,
+    restores train mode on exit; no grad.
+
+    The two metrics are priced very differently and so are sampled
+    differently. Both share one `model.encode` per sample, but the CTC
+    read-out is then just an argmax over that output, while the AR read-out
+    is a full greedy decode -- and in "sequential" mode that emits ONE TOKEN
+    PER FORWARD PASS. Measured on CUDA: ~1072 ms/sample sequential against
+    ~26 ms/sample blockwise, so on a real run the AR decode was 100% of a
+    10.7-minute eval that ran every 500 steps -- 71% of total wall clock,
+    spent re-confirming a number that moves slowly. `ar_limit` therefore
+    caps the AR decode at the first N samples while CTC CER still covers all
+    of `val_samples`; the returned counts say what each number was measured
+    over, so a small-n AR CER is never mistaken for a full-set one."""
     import editdistance  # noqa: PLC0415 -- kept local so training without eval has no hard dep
 
     def cer(refs, hyps):
+        if not refs:
+            return float("nan")
         edits = sum(editdistance.eval(r, h) for r, h in zip(refs, hyps))
         return edits / (sum(len(r) for r in refs) or 1)
 
     was_training = model.training
     model.eval()
-    ar_refs, ar_hyps, ctc_hyps = [], [], []
+    ar_refs, ar_hyps, ctc_refs, ctc_hyps = [], [], [], []
     with torch.no_grad():
-        for sample in val_samples:
+        for i, sample in enumerate(val_samples):
             chunk_tensors, _ = chunk_line_image(
                 sample.image_source, model_cfg.chunk_width, model_cfg.chunk_overlap, model_cfg.img_height,
             )
             chunk_batch = torch.stack(chunk_tensors).to(device)
-            chunks_per_line = torch.tensor([len(chunk_tensors)], dtype=torch.long, device=device)
+            # host tensor on purpose -- the encoder only reads this via .tolist()
+            # for Python control flow; see data/dataset.py's HOST_ONLY_BATCH_KEYS.
+            chunks_per_line = torch.tensor([len(chunk_tensors)], dtype=torch.long)
             enc_out, enc_lengths, enc_block_ids = model.encode(chunk_batch, chunks_per_line)
-            if mode == "sequential":
-                tokens = model.decoder.decode_greedy_sequential(enc_out, enc_lengths)[0].tolist()
-            else:
-                max_blocks = min(len(chunk_tensors), 256 // max(1, model_cfg.max_tokens_per_block) + 1)
-                tokens = model.decoder.decode_greedy(enc_out, enc_lengths, enc_block_ids, max_blocks)[0].tolist()
-            ar_refs.append(sample.text)
-            ar_hyps.append(tokenizer.decode(tokens, strip_control=True))
+
+            if ar_limit is None or i < ar_limit:
+                if mode == "sequential":
+                    tokens = model.decoder.decode_greedy_sequential(enc_out, enc_lengths)[0].tolist()
+                else:
+                    max_blocks = min(len(chunk_tensors), 256 // max(1, model_cfg.max_tokens_per_block) + 1)
+                    tokens = model.decoder.decode_greedy(enc_out, enc_lengths, enc_block_ids, max_blocks)[0].tolist()
+                ar_refs.append(sample.text)
+                ar_hyps.append(tokenizer.decode(tokens, strip_control=True))
+
             ctc_ids = model.ctc_head(enc_out).argmax(-1)[0]
             seq, prev = [], -1
             for t in range(int(enc_lengths[0])):
@@ -242,10 +262,11 @@ def evaluate_val_cer(model, tokenizer, model_cfg, val_samples, device, char_voca
                 if c != prev and c != char_vocab.blank_id:
                     seq.append(c)
                 prev = c
+            ctc_refs.append(sample.text)
             ctc_hyps.append(char_vocab.decode(seq))
     if was_training:
         model.train()
-    return cer(ar_refs, ar_hyps), cer(ar_refs, ctc_hyps)
+    return cer(ar_refs, ar_hyps), cer(ctc_refs, ctc_hyps), len(ar_refs), len(ctc_refs)
 
 
 def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots=None, dedup_manifest_path=None,
@@ -470,12 +491,13 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
 
             if train_cfg.eval_every > 0 and step % train_cfg.eval_every == 0 and eval_samples:
                 t_eval = time.time()
-                ar_cer, ctc_cer = evaluate_val_cer(
-                    model, tokenizer, model_cfg, eval_samples, device, char_vocab, mode=ar_mode)
+                ar_cer, ctc_cer, n_ar, n_ctc = evaluate_val_cer(
+                    model, tokenizer, model_cfg, eval_samples, device, char_vocab, mode=ar_mode,
+                    ar_limit=train_cfg.max_ar_eval_samples)
                 epoch = step / steps_per_epoch
-                logger.info(f"eval step {step} epoch {epoch:.2f} val_ar_cer {ar_cer:.4f} "
-                            f"val_ctc_cer {ctc_cer:.4f} (n={len(eval_samples)} of {len(val_samples)} "
-                            f"held out, {time.time() - t_eval:.1f}s)")
+                logger.info(f"eval step {step} epoch {epoch:.2f} val_ar_cer {ar_cer:.4f} (n={n_ar}) "
+                            f"val_ctc_cer {ctc_cer:.4f} (n={n_ctc} of {len(val_samples)} held out) "
+                            f"[{time.time() - t_eval:.1f}s]")
                 trunc = truncation_stats()
                 if trunc:
                     logger.info("AR block truncation so far: " + ", ".join(
@@ -533,6 +555,10 @@ def main():
     parser.add_argument("--eval-every", type=int, default=None,
                          help="Compute quantitative held-out val CER (AR + CTC) every N steps, logged to "
                               "train.log and eval_log.csv. 0 disables.")
+    parser.add_argument("--max-ar-eval-samples", type=int, default=None,
+                         help="Cap on the AR greedy decode inside each periodic eval (default 64). The "
+                              "AR decode dominates eval cost (~1072 ms/sample in sequential mode vs ~26 "
+                              "blockwise); CTC CER still covers all --max-eval-samples. 0 = CTC only.")
     parser.add_argument("--max-eval-samples", type=int, default=None,
                          help="Cap on val samples decoded per periodic eval (default 512). The full val "
                               "set is thousands of samples decoded one at a time, which at production "
@@ -570,6 +596,8 @@ def main():
         train_cfg.sample_every = args.sample_every
     if args.max_eval_samples is not None:
         train_cfg.max_eval_samples = args.max_eval_samples
+    if args.max_ar_eval_samples is not None:
+        train_cfg.max_ar_eval_samples = args.max_ar_eval_samples
     if args.eval_every is not None:
         train_cfg.eval_every = args.eval_every
     if args.num_workers is not None:
