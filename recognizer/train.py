@@ -30,9 +30,26 @@ import argparse
 import csv
 import logging
 import math
+import os
 import random
 import time
 from pathlib import Path
+
+# Must run before `import torch` below (and before anything else in this process
+# ever imports torch) -- the CUDA allocator reads its config once, at first
+# CUDA-context init, and setting this any later has no effect. setdefault, not
+# assignment, so a caller who already set it (e.g. a notebook's very first cell,
+# the only place this can reliably run before the notebook's OWN earlier `import
+# torch` cell) isn't silently overridden. Targets allocator fragmentation from
+# many steps of variable-shaped batches (width-bucketed training -> a different
+# ar_logits/enc_out size nearly every step): observed in practice as a CUDA OOM
+# ~47k steps into an otherwise-healthy run, with "reserved but unallocated"
+# memory in the traceback -- PyTorch's own suggested fix for exactly that
+# signature. Both env var names are set since different torch versions read
+# different ones (newer: PYTORCH_ALLOC_CONF; CUDA-specific alias some versions
+# still expect: PYTORCH_CUDA_ALLOC_CONF) -- harmless if a given build ignores one.
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 import torch.nn.functional as F
@@ -525,6 +542,9 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
                     f"{train_cfg.sequential_ar_steps} (plain teacher forcing, unrestricted "
                     f"cross-attention -- see modules/decoder.py), then blockwise for the rest.")
     ar_mode_logged_switch = train_cfg.sequential_ar_steps <= 0  # already "switched" if disabled from the start
+    oom_skips = 0  # see the except block below -- a real run hit a CUDA OOM ~47k steps
+                   # in with no protection past the one-time startup batch-size probe,
+                   # killing the entire multi-hour run over a single bad batch.
     model.train()
     t0 = time.time()
     while step < train_cfg.max_steps:
@@ -535,20 +555,54 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
             if ar_mode == "blockwise" and not ar_mode_logged_switch:
                 logger.info(f"step {step}: switching AR decoder from sequential to blockwise mode")
                 ar_mode_logged_switch = True
-            batch = move_batch(batch, device)
-            ar_targets_for_mode = batch["ar_flat_targets"] if ar_mode == "sequential" else batch["ar_targets"]
-            ctc_logits, ar_logits, enc_lengths = model(
-                batch["chunks"], batch["chunks_per_line"], ar_targets_for_mode, mode=ar_mode)
-            loss, ctc_loss, ce_loss = compute_loss(
-                ctc_logits, ar_logits, batch, train_cfg.ctc_weight, tokenizer.pad_id, ctc_blank_id,
-                enc_lengths=enc_lengths, ar_targets=ar_targets_for_mode,
-            )
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            if is_xla:
-                xm.optimizer_step(optimizer)  # reduces gradients across cores + steps + marks the XLA graph
-            else:
-                optimizer.step()
+            try:
+                batch = move_batch(batch, device)
+                ar_targets_for_mode = batch["ar_flat_targets"] if ar_mode == "sequential" else batch["ar_targets"]
+                ctc_logits, ar_logits, enc_lengths = model(
+                    batch["chunks"], batch["chunks_per_line"], ar_targets_for_mode, mode=ar_mode)
+                loss, ctc_loss, ce_loss = compute_loss(
+                    ctc_logits, ar_logits, batch, train_cfg.ctc_weight, tokenizer.pad_id, ctc_blank_id,
+                    enc_lengths=enc_lengths, ar_targets=ar_targets_for_mode,
+                )
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                if is_xla:
+                    xm.optimizer_step(optimizer)  # reduces gradients across cores + steps + marks the XLA graph
+                else:
+                    optimizer.step()
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as exc:
+                # torch.cuda.OutOfMemoryError is the clean case, but NOT the only shape
+                # a memory failure takes here: with PYTORCH_ALLOC_CONF=expandable_segments
+                # (set near this module's imports, specifically to prevent OOMs) an
+                # over-budget CUDA allocation was observed to instead raise a plain
+                # RuntimeError("CUDA driver error: device not ready") on at least one
+                # driver/GPU combination -- confirmed empty_cache() and further CUDA work
+                # both still succeed afterward in the same process, so this is exactly as
+                # recoverable as the clean case, just wrapped differently. A bare
+                # RuntimeError can mean many things that AREN'T memory-related (a real
+                # bug, a shape mismatch), so only the OOM-shaped ones are swallowed here;
+                # anything else re-raises immediately rather than silently skipping steps
+                # over a genuine bug.
+                msg = str(exc).lower()
+                is_oom = isinstance(exc, torch.cuda.OutOfMemoryError) or any(
+                    s in msg for s in ("out of memory", "device not ready", "cuda driver error"))
+                if not is_oom:
+                    raise
+                # Observed cause in practice: CUDA allocator fragmentation building up
+                # over many steps of variable-shaped batches (width-bucketed training --
+                # a different ar_logits/enc_out size nearly every step), not a genuine
+                # peak-memory miss on this specific batch -- so skipping the one unlucky
+                # batch and continuing is the right response, not shrinking the batch
+                # size forever the way the startup probe does.
+                oom_skips += 1
+                optimizer.zero_grad(set_to_none=True)
+                torch.cuda.empty_cache()
+                logger.warning(
+                    f"step {step}: CUDA OOM on a batch of {batch['chunks_per_line'].shape[0]} lines / "
+                    f"{batch['chunks'].shape[0]} chunks (mode={ar_mode}, oom_skips so far: {oom_skips}) "
+                    f"-- skipping this batch and continuing. {exc}"
+                )
+                continue
             scheduler.step()
             step += 1
 
@@ -556,8 +610,9 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
                 lr = scheduler.get_last_lr()[0]
                 elapsed = time.time() - t0
                 epoch = step / steps_per_epoch
+                oom_note = f" oom_skips {oom_skips}" if oom_skips else ""
                 logger.info(f"step {step} epoch {epoch:.2f} loss {loss.item():.4f} ctc {ctc_loss.item():.4f} "
-                            f"ce {ce_loss.item():.4f} lr {lr:.2e} ({elapsed:.1f}s)")
+                            f"ce {ce_loss.item():.4f} lr {lr:.2e} ({elapsed:.1f}s){oom_note}")
                 with log_path.open("a", newline="") as f:
                     csv.writer(f).writerow([step, f"{epoch:.4f}", loss.item(), ctc_loss.item(), ce_loss.item(), lr])
 
@@ -601,7 +656,8 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
                     url = push_checkpoint(ckpt_path, **kwargs)
                     logger.info(f"pushed checkpoint to {url}")
 
-    logger.info(f"training complete: {step} steps, checkpoints + log in {ckpt_dir}")
+    oom_note = f", {oom_skips} batches skipped due to CUDA OOM" if oom_skips else ""
+    logger.info(f"training complete: {step} steps, checkpoints + log in {ckpt_dir}{oom_note}")
     return model
 
 
