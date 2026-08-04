@@ -62,3 +62,29 @@ def pull_latest_checkpoint(dest_dir: Path, token: str = None, repo_id: str = HF_
         import shutil
         shutil.copy(downloaded, dest_path)
     return dest_path
+
+
+def pull_checkpoint_at_step(dest_dir: Path, step: int, token: str = None, repo_id: str = HF_MODEL_REPO_ID):
+    """Downloads the EXACT `step_{step:07d}.pt` checkpoint from `repo_id` into
+    `dest_dir` and returns its local Path -- or None if that specific file
+    doesn't exist. Unlike pull_latest_checkpoint (always the newest, for
+    resuming a session that got interrupted), this is for deliberately
+    rewinding: e.g. resuming from an earlier point in a training curriculum
+    under a changed TrainConfig (a different sequential_ar_steps, say) rather
+    than continuing forward from wherever a prior run happened to stop."""
+    from huggingface_hub import hf_hub_download
+    from huggingface_hub.utils import EntryNotFoundError, RepositoryNotFoundError
+
+    filename = f"step_{step:07d}.pt"
+    try:
+        downloaded = hf_hub_download(repo_id=repo_id, filename=filename, token=token)
+    except (RepositoryNotFoundError, EntryNotFoundError):
+        return None
+
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_path = dest_dir / filename
+    if str(Path(downloaded).resolve()) != str(dest_path.resolve()):
+        import shutil
+        shutil.copy(downloaded, dest_path)
+    return dest_path
