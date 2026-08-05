@@ -69,6 +69,17 @@ class TrainConfig:
     # 23.5% of sokheng_synthetic_v1 and 0.0% of every other source. Set False
     # (--keep-unlearnable) to train on them anyway.
     filter_unlearnable: bool = True
+    # Circuit breaker for the per-step CUDA OOM catch-and-skip in train.py's main loop.
+    # A real run hit a state where the GPU was chronically near-full (~13 GiB/14.56 GiB
+    # in active use, not just fragmented) and EVERY subsequent batch OOM'd -- the
+    # catch-and-skip logic, with no cap, retried at near-zero latency for 8 hours and
+    # 127,000+ attempts with the step counter frozen the entire time, burning GPU-hours
+    # for zero progress instead of the loud, immediate crash that preceded it (arguably
+    # worse). After this many CONSECUTIVE OOMs (resets to 0 on any successful step),
+    # run_training raises instead of retrying again -- a fast, actionable failure beats
+    # a silent multi-hour hang, and the periodic checkpoint (ckpt_every) already has
+    # everything worth keeping from before the streak started.
+    max_consecutive_oom: int = 20
     num_samples: int = 3
     num_workers: int = 8
     seed: int = 0

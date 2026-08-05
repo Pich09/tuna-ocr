@@ -28,6 +28,7 @@ directly instead of shelling out to this CLI.
 """
 import argparse
 import csv
+import gc
 import logging
 import math
 import os
@@ -542,9 +543,13 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
                     f"{train_cfg.sequential_ar_steps} (plain teacher forcing, unrestricted "
                     f"cross-attention -- see modules/decoder.py), then blockwise for the rest.")
     ar_mode_logged_switch = train_cfg.sequential_ar_steps <= 0  # already "switched" if disabled from the start
-    oom_skips = 0  # see the except block below -- a real run hit a CUDA OOM ~47k steps
-                   # in with no protection past the one-time startup batch-size probe,
-                   # killing the entire multi-hour run over a single bad batch.
+    oom_skips = 0          # total OOMs across the whole run, for visibility in the logs
+    consecutive_oom = 0    # resets to 0 on any successful step -- see the except block
+                           # below, and TrainConfig.max_consecutive_oom's docstring for
+                           # why this exists and what happens without it (it happened).
+    # Pre-bound so the except block can unconditionally `del` them even on the very
+    # first-ever iteration (before any successful step exists to have assigned them).
+    ctc_logits = ar_logits = loss = ctc_loss = ce_loss = enc_lengths = None
     model.train()
     t0 = time.time()
     while step < train_cfg.max_steps:
@@ -588,21 +593,50 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
                     s in msg for s in ("out of memory", "device not ready", "cuda driver error"))
                 if not is_oom:
                     raise
-                # Observed cause in practice: CUDA allocator fragmentation building up
-                # over many steps of variable-shaped batches (width-bucketed training --
-                # a different ar_logits/enc_out size nearly every step), not a genuine
-                # peak-memory miss on this specific batch -- so skipping the one unlucky
-                # batch and continuing is the right response, not shrinking the batch
-                # size forever the way the startup probe does.
+                # Usually allocator fragmentation from many steps of variable-shaped
+                # batches (width-bucketed training -- a different ar_logits/enc_out size
+                # nearly every step), not a genuine peak-memory miss on this specific
+                # batch -- so skipping the one unlucky batch is usually the right
+                # response. But NOT always: a real run reached a state where the GPU was
+                # chronically near-full (steady-state usage had grown, not just
+                # fragmented) and every subsequent batch OOM'd too -- skip-and-retry with
+                # no cap turned that into an 8-hour, 127,000-attempt silent hang with the
+                # step counter frozen the whole time, burning GPU-hours for zero
+                # progress. consecutive_oom (below) exists specifically to catch that
+                # case and fail loudly instead.
                 oom_skips += 1
+                consecutive_oom += 1
                 optimizer.zero_grad(set_to_none=True)
+                # Explicit, unconditional del: on OOM, the try block aborts partway
+                # through, so any of these NOT reassigned by output of a later line still
+                # hold whatever a PRIOR successful step computed -- pinning that memory
+                # for the rest of the run if every later batch also fails, since nothing
+                # ever reaches the line that would overwrite them. Pre-bound to None
+                # before the loop, so this is always safe to del regardless of how far
+                # the try got or whether any step has ever succeeded yet.
+                del ctc_logits, ar_logits, loss, ctc_loss, ce_loss, enc_lengths
+                gc.collect()  # autograd graphs can hold reference cycles that plain
+                              # refcounting won't collect before empty_cache() runs
                 torch.cuda.empty_cache()
+                first_line = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
                 logger.warning(
-                    f"step {step}: CUDA OOM on a batch of {batch['chunks_per_line'].shape[0]} lines / "
-                    f"{batch['chunks'].shape[0]} chunks (mode={ar_mode}, oom_skips so far: {oom_skips}) "
-                    f"-- skipping this batch and continuing. {exc}"
+                    f"step {step}: CUDA OOM #{consecutive_oom}/{train_cfg.max_consecutive_oom} on a "
+                    f"batch of {batch['chunks_per_line'].shape[0]} lines / {batch['chunks'].shape[0]} "
+                    f"chunks (mode={ar_mode}, {oom_skips} total this run) -- skipping. {first_line}"
                 )
+                if consecutive_oom >= train_cfg.max_consecutive_oom:
+                    raise RuntimeError(
+                        f"{consecutive_oom} consecutive CUDA OOMs at step {step} -- this is no longer "
+                        f"'one unlucky batch', the GPU is stuck too full to make progress. Stopping "
+                        f"instead of retrying forever (that already happened once: 127,000+ silent "
+                        f"retries over 8 hours with zero steps completed). The last checkpoint "
+                        f"(step {step - step % train_cfg.ckpt_every}) already has everything from "
+                        f"before this streak started -- resume from it, and consider a smaller "
+                        f"TrainConfig.batch_size if this recurs. Last error:\n{exc}"
+                    ) from exc
+                ctc_logits = ar_logits = loss = ctc_loss = ce_loss = enc_lengths = None
                 continue
+            consecutive_oom = 0
             scheduler.step()
             step += 1
 
