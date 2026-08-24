@@ -8,6 +8,7 @@ alignment, each sample's tagged token sequence is uniform-split into
 import json
 import math
 import warnings
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -250,9 +251,12 @@ def compute_widths(dataset: "OCRLineDataset", num_workers: int = 32, cache_path:
     disk, paid before the first training step on EVERY (re)start. The result
     is a pure function of the sample list, so `cache_path` memoizes it to
     disk: subsequent runs over the same data load it in seconds. The cache
-    is keyed on the sample list's identity (length + first/last path), so a
-    changed dataset misses the cache and recomputes rather than silently
-    reusing stale widths."""
+    is keyed on the sample list's identity (length + a checksum over every
+    sample's identity, not just the first/last), so a changed dataset misses
+    the cache and recomputes rather than silently reusing stale widths --
+    two differently-filtered sample lists of the same length whose first and
+    last samples happen to coincide (e.g. two runs of this dataset with a
+    different filter_unlearnable/dedup setting) would otherwise collide."""
     def _sample_key(s):
         # image_path gives a stable identity for path-backed samples; bytes-backed
         # samples (Arrow-packed, see manifest.py) have no path, so fall back to a
@@ -264,11 +268,17 @@ def compute_widths(dataset: "OCRLineDataset", num_workers: int = 32, cache_path:
 
     key = None
     if cache_path is not None and len(dataset) > 0:
-        # "v2": versions the formula, not just the data -- v1 cached RAW pixel
-        # widths; image_width now returns scaled width, so a v1 cache would be
-        # silently wrong for bucketing/probing if reused.
-        key = (f"v2|{len(dataset)}|{_sample_key(dataset.samples[0])}|"
-               f"{_sample_key(dataset.samples[-1])}")
+        # crc32 over every sample's identity (cheap in-memory string ops, not I/O --
+        # negligible next to the disk-bound width scan below) instead of just the
+        # first/last sample, so a middle-of-the-list change (a different filter
+        # config producing the same length and endpoints) can't silently collide.
+        checksum = 0
+        for s in dataset.samples:
+            checksum = zlib.crc32(_sample_key(s).encode("utf-8"), checksum)
+        # "v3": versions the formula, not just the data -- v1 cached RAW pixel
+        # widths; image_width now returns scaled width, and v2 keyed only on
+        # first/last sample identity, both silently wrong for a v3 reader.
+        key = f"v3|{len(dataset)}|{checksum}"
         try:
             with open(cache_path, encoding="utf-8") as f:
                 blob = json.load(f)

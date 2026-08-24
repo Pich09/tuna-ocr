@@ -91,7 +91,8 @@ def build_logger(ckpt_dir: Path, run_name: str) -> logging.Logger:
     return logger
 
 
-def find_max_batch_size(model, dataset, collate_fn, device, widths, start: int = 64, min_batch: int = 1) -> int:
+def find_max_batch_size(model, dataset, collate_fn, device, widths, start: int = 64, min_batch: int = 1,
+                        mode: str = "blockwise") -> int:
     """OOM-probing auto-tune: try `start`, halve on CUDA OOM until a batch
     fits (forward + backward). CPU/TPU just use the configured default --
     on TPU, memory errors don't surface as a catchable Python OOM the same
@@ -116,7 +117,14 @@ def find_max_batch_size(model, dataset, collate_fn, device, widths, start: int =
     2x the model's parameter footprint. A dummy tensor (not a real
     optimizer.step()) verifies the room exists without nudging the model's
     actual initialization with a bogus gradient from this probe's fake
-    (sum-of-logits) objective."""
+    (sum-of-logits) objective.
+
+    `mode` must match whichever AR mode the run will actually start in
+    ("sequential" vs "blockwise" have different attention memory profiles --
+    sequential's cross-attention prefix grows unboundedly instead of using a
+    fixed block window, see decoder.py's "Two-stage training" note) --
+    probing the wrong mode can pass at a batch size that then OOMs once real
+    training steps run in the other mode."""
     if device.type != "cuda":
         return start
     widest_idx = sorted(range(len(widths)), key=lambda i: widths[i], reverse=True)
@@ -127,7 +135,8 @@ def find_max_batch_size(model, dataset, collate_fn, device, widths, start: int =
             idxs = widest_idx[:bs]
             batch = collate_fn([dataset[i] for i in idxs])
             batch = move_batch(batch, device)
-            ctc_logits, ar_logits, _ = model(batch["chunks"], batch["chunks_per_line"], batch["ar_targets"])
+            ar_targets = batch["ar_flat_targets"] if mode == "sequential" else batch["ar_targets"]
+            ctc_logits, ar_logits, _ = model(batch["chunks"], batch["chunks_per_line"], ar_targets, mode=mode)
             (ctc_logits.float().sum() + ar_logits.float().sum()).backward()
             optim_reserve = torch.empty(optim_state_bytes, dtype=torch.uint8, device=device)
             del optim_reserve
@@ -448,8 +457,18 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
 
     batch_size = train_cfg.batch_size
     if auto_batch_size and device.type == "cuda":
-        batch_size = find_max_batch_size(model, train_ds, collate_fn, device, widths, start=max(64, train_cfg.batch_size))
-        logger.info(f"auto batch size: {batch_size}")
+        # Probe every AR mode the run could start in: a fresh or resumed-before-
+        # the-switch run starts in "sequential" mode, whose growing-prefix
+        # attention has a different memory profile than "blockwise" (see
+        # find_max_batch_size's docstring) -- probing only blockwise can pass at
+        # a batch size that then OOMs once sequential-mode steps actually run.
+        modes_to_probe = ["blockwise"] if train_cfg.sequential_ar_steps <= 0 else ["sequential", "blockwise"]
+        batch_size = min(
+            find_max_batch_size(model, train_ds, collate_fn, device, widths,
+                                start=max(64, train_cfg.batch_size), mode=mode)
+            for mode in modes_to_probe
+        )
+        logger.info(f"auto batch size: {batch_size} (probed mode(s): {', '.join(modes_to_probe)})")
     elif auto_batch_size:
         # Gated on CUDA at the call site, not just inside the probe: the probe's
         # non-CUDA early-return hands back its `start` argument, which is
@@ -534,6 +553,24 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
         optimizer.load_state_dict(state["optimizer_state_dict"])
         scheduler.load_state_dict(state["scheduler_state_dict"])
         step = state["step"]
+        # scheduler.load_state_dict only restores LambdaLR's internal step counter --
+        # the lambda itself was just rebuilt above from the CURRENT train_cfg.
+        # warmup_steps/max_steps, not whatever the checkpoint was actually trained
+        # under. If those differ, the restored step count now drives a
+        # differently-shaped LR curve (can re-enter warmup or skip straight past
+        # cosine decay) with nothing else here to indicate it happened.
+        old_warmup = state.get("train_cfg_warmup_steps")
+        old_max_steps = state.get("train_cfg_max_steps")
+        if (old_warmup is not None and old_warmup != train_cfg.warmup_steps) or \
+           (old_max_steps is not None and old_max_steps != train_cfg.max_steps):
+            logger.info(
+                f"WARNING: resuming at step {step}, but the LR schedule this run is "
+                f"configured with (warmup_steps={train_cfg.warmup_steps}, "
+                f"max_steps={train_cfg.max_steps}) differs from what the checkpoint was "
+                f"trained under (warmup_steps={old_warmup}, max_steps={old_max_steps}). "
+                f"The restored step count will now drive a differently-shaped LR curve "
+                f"-- this is intentional if you meant to change the schedule, but check "
+                f"scheduler.get_last_lr() against expectations if not.")
         logger.info(f"resumed from {resume_path} at step {step} "
                     f"({train_cfg.max_steps - step} steps remaining to max_steps={train_cfg.max_steps})")
 
@@ -677,6 +714,12 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
                     "optimizer_state_dict": optimizer.state_dict(),
                     "scheduler_state_dict": scheduler.state_dict(), "model_cfg": model_cfg,
                     "char_vocab": char_vocab.to_json(),
+                    # LambdaLR.state_dict() does NOT include warmup_steps/max_steps (the
+                    # lambda closure isn't picklable) -- only its internal last_epoch
+                    # counter. Recorded here so a resume can detect (and warn on) a
+                    # changed schedule instead of silently reshaping the LR curve.
+                    "train_cfg_warmup_steps": train_cfg.warmup_steps,
+                    "train_cfg_max_steps": train_cfg.max_steps,
                 }
                 save_fn = xm.save if is_xla else torch.save  # xm.save moves XLA tensors to CPU before writing
                 save_fn(state, ckpt_path)

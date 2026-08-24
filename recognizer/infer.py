@@ -26,12 +26,18 @@ def infer(checkpoint_path: Path, image_path: Path, tokenizer_dir=TOKENIZER_ASSET
 
     chunk_tensors, _ = chunk_line_image(image_path, model_cfg.chunk_width, model_cfg.chunk_overlap, model_cfg.img_height)
     chunk_batch = torch.stack(chunk_tensors).to(device)
-    chunks_per_line = torch.tensor([len(chunk_tensors)], dtype=torch.long, device=device)
+    # Stays on host, matching dataset.py's HOST_ONLY_BATCH_KEYS convention: only ever
+    # read via .tolist() in encoder.py, so moving it to the accelerator just costs a
+    # needless device sync (a full pipeline stall on XLA) for no benefit.
+    chunks_per_line = torch.tensor([len(chunk_tensors)], dtype=torch.long)
 
     enc_out, enc_lengths, enc_block_ids = model.encode(chunk_batch, chunks_per_line)
     max_blocks = min(len(chunk_tensors), max_len // max(1, model_cfg.max_tokens_per_block) + 1)
     tokens = model.decoder.decode_greedy(enc_out, enc_lengths, enc_block_ids, max_blocks)[0].tolist()
-    tokens = truncate_blocks(tokens, model_cfg.max_tokens_per_block, tokenizer.eob_id, tokenizer.pad_id)
+    # num_blocks=len(chunk_tensors): drops any blocks the greedy decode emitted past
+    # this line's real chunk count, same as every other call site (train.py, evaluate.py).
+    tokens = truncate_blocks(tokens, model_cfg.max_tokens_per_block, tokenizer.eob_id, tokenizer.pad_id,
+                             num_blocks=len(chunk_tensors))
     return tokenizer.decode(tokens, strip_control=not keep_tags)
 
 
