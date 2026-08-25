@@ -50,9 +50,12 @@ def pad_to_width(chunk: torch.Tensor, target_width: int) -> torch.Tensor:
 def chunk_line_image(image_source, chunk_width: int, chunk_overlap: int, target_height: int = 64):
     """Loads the whole-line image (path or raw bytes, see open_image) and
     returns (chunk_tensors, valid_widths): chunk_tensors is a list of
-    (1, target_height, chunk_width) tensors (the rare narrower-than-one-chunk
-    line is right-padded), valid_widths is the real (unpadded) pixel width
-    of each chunk, for the encoder's frame-count accounting."""
+    (1, target_height, chunk_width) tensors (the last chunk of a multi-chunk
+    line, and a whole line narrower than one chunk, are right-padded to
+    chunk_width -- see chunk_image_overlap's docstring for why the last
+    chunk is padded rather than shifted left), valid_widths is the real
+    (unpadded) pixel width of each chunk, for the encoder's frame-count
+    accounting."""
     line_tensor = load_and_normalize(image_source, target_height)
     line_img = Image.fromarray((line_tensor.squeeze(0).numpy() * 255).astype(np.uint8), mode="L")
     chunks = chunk_image_overlap(line_img, chunk_width=chunk_width, overlap=chunk_overlap)

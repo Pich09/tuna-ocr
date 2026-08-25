@@ -34,10 +34,20 @@ def chunk_image_overlap(img: Image.Image, chunk_width: int, overlap: int) -> lis
 
     If `img` is narrower than `chunk_width`, it's returned as a single
     unpadded chunk (never invent blank content for a real line already
-    shorter than one block). Otherwise every chunk is exactly
-    `chunk_width` wide; the last chunk is shifted left (not blank-padded)
-    so it doesn't run past the image and every chunk has only real pixel
-    content.
+    shorter than one block). Otherwise every chunk keeps its regular
+    `i * stride` start position -- including the last one, which is left
+    narrower than `chunk_width` (real pixel content only) rather than
+    shifted left to sit flush with the image's right edge. Shifting the
+    last chunk left made ITS overlap with the second-to-last chunk whatever
+    was needed to reach the right edge -- generally far more than `overlap`
+    px, since a line's pixel width is essentially never an exact multiple
+    of `stride`. Callers that need a uniform chunk_width (e.g. batching
+    into a fixed-size tensor) are expected to right-pad the narrower last
+    chunk themselves (see recognizer/data/transforms.py's pad_to_width) --
+    that keeps every chunk's real-content overlap with its predecessor at
+    exactly `overlap` px, which is what downstream encoder stitching
+    (recognizer/modules/encoder.py) assumes when trimming a fixed number of
+    overlap frames off the front of every non-first chunk.
     """
     if not (0 <= overlap < chunk_width):
         raise ValueError(f"overlap must satisfy 0 <= overlap < chunk_width, got overlap={overlap}, chunk_width={chunk_width}")
@@ -49,10 +59,10 @@ def chunk_image_overlap(img: Image.Image, chunk_width: int, overlap: int) -> lis
     stride = chunk_width - overlap
     chunks = []
     x = 0
-    while True:
-        start = min(x, w - chunk_width)
-        chunks.append(Chunk(image=img.crop((start, 0, start + chunk_width, h)), x_offset=start, width=chunk_width))
-        if start == w - chunk_width:
+    while x < w:
+        end = min(x + chunk_width, w)
+        chunks.append(Chunk(image=img.crop((x, 0, end, h)), x_offset=x, width=end - x))
+        if end == w:
             break
         x += stride
     return chunks
