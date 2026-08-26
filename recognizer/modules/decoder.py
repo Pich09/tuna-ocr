@@ -7,17 +7,21 @@ fill a block.
 
 Concretely: the decoder runs an ordinary causal self-attention stack over
 the (teacher-forced, shifted-right) flattened target sequence, with
-cross-attention restricted so a position in block b only sees encoder
-frames from blocks 0..b (never future blocks -- see ConformerEncoder's
-1:1 chunk/block correspondence). The hidden state at the FIRST position of
-block b (i.e. right after consuming the last real token of block b-1) is
-computed purely from already-committed history, so applying the K-way
-`block_head` to it yields all of block b's token logits in one shot,
-without needing block b's own tokens as input. This is what makes it safe
-to predict a whole block per step: a slot's prediction never depends on
-another slot's true identity from the same block (no leakage), and at
-inference no chicken-and-egg problem arises (block b's prefix only needs
-block b-1's already-decided tokens).
+cross-attention over the WHOLE line's encoder output (all chunks, not
+windowed to blocks 0..b -- see "Cross-attention window" below for why).
+The hidden state at the FIRST position of block b (i.e. right after
+consuming the last real token of block b-1) is computed purely from
+already-committed history, so applying the K-way `block_head` to it
+yields all of block b's token logits in one shot, without needing block
+b's own tokens as input. This is what makes it safe to predict a whole
+block per step: a slot's prediction never depends on another slot's true
+identity from the same block (no leakage), and at inference no
+chicken-and-egg problem arises (block b's prefix only needs block b-1's
+already-decided tokens). Note this safety property is about SELF-attention
+over decoder tokens (governed by the causal mask over already-committed
+history); it has nothing to do with how much of the encoder's output
+cross-attention is allowed to see, which is a separate, freely choosable
+design knob -- see below.
 
 Known v1 simplification: inference recomputes the whole prefix on every
 block step (no KV-cache) -- fine for short OCR lines, noted as a future
@@ -26,13 +30,38 @@ optimization in recognizer/README.md.
 Two-stage training (forward_sequential / decode_greedy_sequential): the
 blockwise supervision above depends on ar_target's uniform-interval split
 of each transcript into per-block token groups -- an approximation, since
-none of these datasets provide real per-character alignment, and a group's
-boundary frequently does not match where those characters actually appear
-in that block's image region. Training blockwise from scratch teaches the
-decoder to reproduce that approximate partitioning rather than real
-image-to-text correspondence (observed in practice: AR val CER stuck well
-above CTC's on the same encoder, despite near-zero AR train loss -- a
-sign of fitting the wrong target, not slow learning).
+none of these datasets provide real per-character alignment. Critically,
+`data/dataset.py`'s `split_into_blocks` divides the transcript by raw
+TOKEN COUNT (`n // num_blocks`), with no awareness of pixel width -- since
+glyph width varies a lot (a run of narrow Latin characters vs a few wide
+Khmer clusters), a block's assigned token slice frequently does NOT match
+which characters are actually rendered in that block's image chunk, not
+just near a boundary but potentially by a chunk or more. Training blockwise
+from scratch teaches the decoder to reproduce that approximate partitioning
+rather than real image-to-text correspondence (observed in practice: AR
+val CER stuck well above CTC's on the same encoder, despite non-trivial AR
+train loss -- a sign of fitting a target that's sometimes simply wrong,
+not slow learning).
+
+Cross-attention window (FIXED): block b's cross-attention used to be
+restricted to encoder blocks 0..b (never later chunks), on the reasoning
+that a block "shouldn't need to look ahead." Combined with the
+token-count-uniform target mismatch above, this restriction actively made
+things worse rather than just harder: when a block's assigned characters
+are actually rendered in a LATER chunk than the string-split assigned them
+to (a real, frequent occurrence, not an edge case), the old window made
+correct prediction structurally impossible for that block -- the evidence
+existed in the image but the mask hid it. Unlike the self-attention causal
+mask (a genuine inference-time constraint -- future tokens haven't been
+generated yet), there is no such constraint on the encoder side: the whole
+image is encoded once, upfront, before any AR decoding happens, so nothing
+is unsafe about letting a block see chunks after its own. Cross-attention
+now sees the full line's encoder output in blockwise mode too, exactly
+like `forward_sequential` already did -- removing one whole class of
+otherwise-unrecoverable errors. This does NOT fix the token-count-split
+mismatch itself (a block can still be trained against the wrong slice of
+text), it only removes the *additional* failure of being unable to see
+correct evidence even when it exists elsewhere in the image.
 
 forward_sequential instead runs plain, fully-sequential teacher forcing
 over the TRUE (unsegmented) token sequence, with cross-attention over the
@@ -144,14 +173,23 @@ class BlockwiseARDecoder(nn.Module):
         return torch.cat([bos_col, flat_ids[:, :-1]], dim=1)
 
     def _masks(self, num_positions: int, enc_block_ids: torch.Tensor, enc_len_mask: torch.Tensor):
+        # enc_block_ids is unused here now -- kept in the signature since every
+        # caller (forward, decode_greedy, _run_stack) already threads it through
+        # from the encoder, and a future partial-window variant may want it
+        # again. See the module docstring's "Cross-attention window (FIXED)"
+        # section: cross-attention used to be restricted to encoder blocks 0..b
+        # via enc_block_ids, which -- combined with split_into_blocks' token-
+        # count-uniform (not pixel-width-aware) target split -- made correct
+        # prediction structurally impossible whenever a block's assigned
+        # characters were actually rendered in a later chunk. There is no
+        # inference-time causality reason for that restriction (the whole
+        # image is encoded upfront, unlike decoder tokens which are genuinely
+        # generated in sequence), so cross-attention now sees the full line's
+        # encoder output here too, exactly like forward_sequential already did.
         device = enc_block_ids.device
         causal = torch.tril(torch.ones(num_positions, num_positions, dtype=torch.bool, device=device))
         self_mask = causal.unsqueeze(0).unsqueeze(0)  # (1,1,N,N), broadcasts over (B,H)
-
-        block_of_pos = torch.arange(num_positions, device=device) // self.K  # (N,)
-        allow = enc_block_ids.unsqueeze(1) <= block_of_pos.view(1, num_positions, 1)  # (B,N,T')
-        allow = allow & enc_len_mask.unsqueeze(1)
-        cross_mask = allow.unsqueeze(1)  # (B,1,N,T'), broadcasts over H
+        cross_mask = enc_len_mask.unsqueeze(1).unsqueeze(1)  # (B,1,1,T') -- full visibility, padding excluded
         return self_mask, cross_mask
 
     def _run_stack(self, flat_ids: torch.Tensor, enc_out: torch.Tensor, enc_lengths: torch.Tensor,
