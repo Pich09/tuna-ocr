@@ -130,6 +130,9 @@ def find_max_batch_size(model, dataset, collate_fn, device, widths, start: int =
     widest_idx = sorted(range(len(widths)), key=lambda i: widths[i], reverse=True)
     optim_state_bytes = sum(p.numel() for p in model.parameters()) * 2 * 4  # fp32 exp_avg + exp_avg_sq
     bs = start
+    # Pre-bound so the except block can unconditionally `del` them even if the
+    # try aborted before assigning -- same pattern as run_training's main loop.
+    ctc_logits = ar_logits = fake_objective = None
     while bs >= min_batch:
         try:
             idxs = widest_idx[:bs]
@@ -143,12 +146,28 @@ def find_max_batch_size(model, dataset, collate_fn, device, widths, start: int =
             optim_reserve = torch.empty(optim_state_bytes, dtype=torch.uint8, device=device)
             del optim_reserve
             model.zero_grad(set_to_none=True)
-            del ctc_logits, ar_logits
+            del ctc_logits, ar_logits, fake_objective
             torch.cuda.empty_cache()
             return bs
-        except torch.cuda.OutOfMemoryError:
+        except (torch.cuda.OutOfMemoryError, RuntimeError) as exc:
+            # Same OOM-shape-detection as run_training's main loop (see its own except
+            # block's comment): an over-budget CUDA allocation doesn't always surface as
+            # the clean torch.cuda.OutOfMemoryError -- CUBLAS_STATUS_ALLOC_FAILED (seen
+            # in practice crashing this exact probe instead of triggering the halve-and-
+            # retry it exists for) and "CUDA driver error: device not ready" are both the
+            # same underlying "GPU too full" condition wearing a plain RuntimeError.
+            # Anything else re-raises immediately rather than silently masking a real bug.
+            msg = str(exc).lower()
+            is_oom = isinstance(exc, torch.cuda.OutOfMemoryError) or any(
+                s in msg for s in ("out of memory", "device not ready", "cuda driver error",
+                                    "cublas_status_alloc_failed", "cudnn_status_alloc_failed"))
+            if not is_oom:
+                raise
             model.zero_grad(set_to_none=True)
+            del ctc_logits, ar_logits, fake_objective
+            gc.collect()  # autograd graph reference cycles -- same reasoning as the main loop's OOM handler
             torch.cuda.empty_cache()
+            ctc_logits = ar_logits = fake_objective = None
             bs //= 2
     return max(min_batch, 1)
 
