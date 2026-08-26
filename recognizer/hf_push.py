@@ -12,34 +12,45 @@ from .config import HF_MODEL_REPO_ID
 _STEP_RE = re.compile(r"^step_(\d+)\.pt$")
 
 
-def push_checkpoint(local_ckpt_path: Path, token: str, repo_id: str = HF_MODEL_REPO_ID, private: bool = True) -> str:
+def push_checkpoint(local_ckpt_path: Path, token: str, repo_id: str = HF_MODEL_REPO_ID, private: bool = True,
+                    path_prefix: str = "") -> str:
     """Uploads `local_ckpt_path` to `repo_id` under the same filename, creating
     the repo on first use (private by default -- this pushes trained model
     weights, so visibility is opt-in, not a default; pass private=False only
     if you've deliberately decided the repo should be public). Returns the
     resulting hub URL. Raises with the underlying huggingface_hub error
     message on failure rather than swallowing it -- a silently-failed
-    checkpoint push is worse than a loud one."""
+    checkpoint push is worse than a loud one.
+
+    `path_prefix`: when set (e.g. "ctc_only"), uploads under that folder
+    (`path_prefix/step_0002000.pt`) instead of the repo root -- lets several
+    independent runs share ONE Hub repo without their step-numbered
+    filenames colliding (see pull_latest_checkpoint's matching `path_prefix`).
+    Empty string (default) uploads at the repo root, unchanged from before."""
     from huggingface_hub import HfApi
 
     api = HfApi(token=token)
     api.create_repo(repo_id=repo_id, exist_ok=True, private=private)
+    filename = Path(local_ckpt_path).name
+    path_in_repo = f"{path_prefix}/{filename}" if path_prefix else filename
     return api.upload_file(
         path_or_fileobj=str(local_ckpt_path),
-        path_in_repo=Path(local_ckpt_path).name,
+        path_in_repo=path_in_repo,
         repo_id=repo_id,
         token=token,
     )
 
 
-def pull_latest_checkpoint(dest_dir: Path, token: str = None, repo_id: str = HF_MODEL_REPO_ID):
-    """Downloads the highest-step `step_*.pt` checkpoint from `repo_id` into
+def pull_latest_checkpoint(dest_dir: Path, token: str = None, repo_id: str = HF_MODEL_REPO_ID, path_prefix: str = ""):
+    """Downloads the highest-step `step_*.pt` checkpoint from `repo_id`
+    (optionally scoped to `path_prefix`'s folder -- see push_checkpoint) into
     `dest_dir` and returns its local Path -- or None if the repo doesn't
-    exist yet or has no checkpoints (a fresh run, nothing to resume from;
-    not an error). Only `step_*.pt` files are considered (not `last.pt`,
-    which push_checkpoint never uploads -- see run_training's ckpt_every
-    block) so this always finds a real, fully-uploaded checkpoint rather
-    than depending on filename conventions that aren't actually pushed."""
+    exist yet or has no checkpoints under that prefix (a fresh run, nothing
+    to resume from; not an error). Only `step_*.pt` files are considered (not
+    `last.pt`, which push_checkpoint never uploads -- see run_training's
+    ckpt_every block) so this always finds a real, fully-uploaded checkpoint
+    rather than depending on filename conventions that aren't actually
+    pushed."""
     from huggingface_hub import HfApi, hf_hub_download
     from huggingface_hub.utils import RepositoryNotFoundError
 
@@ -49,7 +60,9 @@ def pull_latest_checkpoint(dest_dir: Path, token: str = None, repo_id: str = HF_
     except RepositoryNotFoundError:
         return None
 
-    steps = [(int(m.group(1)), f) for f in files if (m := _STEP_RE.match(f))]
+    prefix = f"{path_prefix}/" if path_prefix else ""
+    steps = [(int(m.group(1)), f) for f in files
+             if f.startswith(prefix) and (m := _STEP_RE.match(f[len(prefix):]))]
     if not steps:
         return None
     _, latest_file = max(steps)
@@ -57,15 +70,17 @@ def pull_latest_checkpoint(dest_dir: Path, token: str = None, repo_id: str = HF_
     downloaded = hf_hub_download(repo_id=repo_id, filename=latest_file, token=token)
     dest_dir = Path(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
-    dest_path = dest_dir / latest_file
+    dest_path = dest_dir / Path(latest_file).name
     if str(Path(downloaded).resolve()) != str(dest_path.resolve()):
         import shutil
         shutil.copy(downloaded, dest_path)
     return dest_path
 
 
-def pull_checkpoint_at_step(dest_dir: Path, step: int, token: str = None, repo_id: str = HF_MODEL_REPO_ID):
-    """Downloads the EXACT `step_{step:07d}.pt` checkpoint from `repo_id` into
+def pull_checkpoint_at_step(dest_dir: Path, step: int, token: str = None, repo_id: str = HF_MODEL_REPO_ID,
+                            path_prefix: str = ""):
+    """Downloads the EXACT `step_{step:07d}.pt` checkpoint from `repo_id`
+    (optionally scoped to `path_prefix`'s folder -- see push_checkpoint) into
     `dest_dir` and returns its local Path -- or None if that specific file
     doesn't exist. Unlike pull_latest_checkpoint (always the newest, for
     resuming a session that got interrupted), this is for deliberately
@@ -76,8 +91,9 @@ def pull_checkpoint_at_step(dest_dir: Path, step: int, token: str = None, repo_i
     from huggingface_hub.utils import EntryNotFoundError, RepositoryNotFoundError
 
     filename = f"step_{step:07d}.pt"
+    repo_filename = f"{path_prefix}/{filename}" if path_prefix else filename
     try:
-        downloaded = hf_hub_download(repo_id=repo_id, filename=filename, token=token)
+        downloaded = hf_hub_download(repo_id=repo_id, filename=repo_filename, token=token)
     except (RepositoryNotFoundError, EntryNotFoundError):
         return None
 

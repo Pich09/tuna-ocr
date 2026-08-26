@@ -348,10 +348,28 @@ def evaluate_val_cer(model, tokenizer, model_cfg, val_samples, device, char_voca
 def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots=None, dedup_manifest_path=None,
                   tokenizer_dir=TOKENIZER_ASSETS_DIR, checkpoint_root=DEFAULT_CHECKPOINT_ROOT, run_name: str = "v1",
                   push_to_hub: bool = False, repo_id=None, hf_token=None, hub_private: bool = True,
-                  auto_batch_size: bool = False, resume_path=None, device=None):
+                  auto_batch_size: bool = False, resume_path=None, device=None, unify_ctc_tokenizer: bool = False,
+                  hub_path_prefix: str = ""):
     """Exactly one of `dedup_manifest_path` (preferred -- output of
     `real_data.deduplicate`) or `real_data_roots` (raw, undeduplicated
-    per-source manifests) must be given."""
+    per-source manifests) must be given.
+
+    hub_path_prefix: when set (e.g. "ctc_only"), checkpoints push to that
+    folder within `repo_id` (`ctc_only/step_0002000.pt`) instead of the repo
+    root -- lets several independent runs share ONE Hub repo without their
+    step-numbered filenames colliding. The caller is responsible for pulling
+    from the SAME prefix on resume (hf_push.pull_latest_checkpoint's own
+    `path_prefix` arg) -- this only controls where run_training PUSHES to.
+
+    unify_ctc_tokenizer: when True, the AR decoder trains against the SAME
+    character-level tokenizer as the CTC head (tokenizer/char_tokenizer.py's
+    CharTokenizer, wrapping the same char set the CTC-only char_vocab already
+    builds below) instead of the shared subword tokenizer -- for the CTC-only
+    /AR-only ablation notebooks, where the two heads must be directly
+    comparable. See char_tokenizer.py's docstring for why subword-CTC was
+    rejected but character-AR is fine. Do not set this for the production
+    two-head run -- the AR decoder is meant to output the shared subword
+    vocab (see recognizer/README.md)."""
     device = device or env_utils.get_torch_device()
     is_xla = device.type == "xla"
     xm = None
@@ -366,8 +384,10 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
     # (load_dedup_manifest ~5-14s, compute_widths ~13s), so if a run is stuck
     # with no output for a long time, these pin down exactly which stage it's
     # actually stuck in, rather than leaving a single opaque multi-step gap.
-    print("run_training: loading tokenizer...", flush=True)
-    tokenizer = KhmerOcrTokenizer(tokenizer_dir)
+    tokenizer = None
+    if not unify_ctc_tokenizer:
+        print("run_training: loading tokenizer...", flush=True)
+        tokenizer = KhmerOcrTokenizer(tokenizer_dir)
     print(f"run_training: loading samples from {dedup_manifest_path or real_data_roots}...", flush=True)
     if dedup_manifest_path:
         samples = load_dedup_manifest(dedup_manifest_path)
@@ -397,6 +417,14 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
     else:
         char_vocab = build_char_vocab((s.text for s in train_samples), min_count=2)
         char_vocab.save(char_vocab_path)
+    if unify_ctc_tokenizer:
+        # Same char set as char_vocab above, wrapped with the AR-side
+        # interface (BOS/EOS/EOB/PAD + encode_plain) -- see CharTokenizer's
+        # docstring. Reused as BOTH `tokenizer` (AR) and `char_vocab` (CTC)
+        # below so every call site that takes either one gets the identical
+        # id mapping for the character portion, with zero other changes.
+        from .tokenizer.char_tokenizer import CharTokenizer  # noqa: PLC0415
+        tokenizer = char_vocab = CharTokenizer(char_vocab.chars)
 
     # Drop samples CTC provably cannot fit (target longer than the encoder
     # frames the image yields). Their loss is +inf, which zero_infinity=True
@@ -727,7 +755,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
                 logger.info(f"saved checkpoint {ckpt_path} (and {ckpt_dir / 'last.pt'} -- "
                             f"resume from either with --resume)")
                 if push_to_hub:
-                    kwargs = {"token": hf_token, "private": hub_private}
+                    kwargs = {"token": hf_token, "private": hub_private, "path_prefix": hub_path_prefix}
                     if repo_id:
                         kwargs["repo_id"] = repo_id
                     url = push_checkpoint(ckpt_path, **kwargs)
