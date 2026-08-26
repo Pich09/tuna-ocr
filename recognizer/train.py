@@ -92,7 +92,7 @@ def build_logger(ckpt_dir: Path, run_name: str) -> logging.Logger:
 
 
 def find_max_batch_size(model, dataset, collate_fn, device, widths, start: int = 64, min_batch: int = 1,
-                        mode: str = "blockwise") -> int:
+                        mode: str = "blockwise", compute_ctc: bool = True, compute_ar: bool = True) -> int:
     """OOM-probing auto-tune: try `start`, halve on CUDA OOM until a batch
     fits (forward + backward). CPU/TPU just use the configured default --
     on TPU, memory errors don't surface as a catchable Python OOM the same
@@ -136,8 +136,10 @@ def find_max_batch_size(model, dataset, collate_fn, device, widths, start: int =
             batch = collate_fn([dataset[i] for i in idxs])
             batch = move_batch(batch, device)
             ar_targets = batch["ar_flat_targets"] if mode == "sequential" else batch["ar_targets"]
-            ctc_logits, ar_logits, _ = model(batch["chunks"], batch["chunks_per_line"], ar_targets, mode=mode)
-            (ctc_logits.float().sum() + ar_logits.float().sum()).backward()
+            ctc_logits, ar_logits, _ = model(batch["chunks"], batch["chunks_per_line"], ar_targets, mode=mode,
+                                             compute_ctc=compute_ctc, compute_ar=compute_ar)
+            fake_objective = sum(t.float().sum() for t in (ctc_logits, ar_logits) if t is not None)
+            fake_objective.backward()
             optim_reserve = torch.empty(optim_state_bytes, dtype=torch.uint8, device=device)
             del optim_reserve
             model.zero_grad(set_to_none=True)
@@ -162,43 +164,66 @@ def lr_lambda(step: int, warmup_steps: int, max_steps: int, min_lr_ratio: float 
 
 def compute_loss(ctc_logits, ar_logits, batch, ctc_weight: float, pad_id: int, ctc_blank_id: int,
                  enc_lengths=None, ar_targets=None):
-    b, t_max, _ = ctc_logits.shape
-    log_probs = F.log_softmax(ctc_logits, dim=-1).transpose(0, 1)  # (T,N,C)
-    # Real per-sample encoder lengths, not t_max: enc_out is zero-padded up to
-    # the batch's longest line, and claiming those padding frames are real
-    # input makes CTC align targets against blank padding.
-    if enc_lengths is not None:
-        ctc_input_lengths = enc_lengths.to(dtype=torch.long, device=ctc_logits.device)
+    """ctc_logits/ar_logits may be None (model.forward's compute_ctc/compute_ar=False,
+    for the CTC-only/AR-only ablation notebooks) -- that head's loss term is
+    then skipped entirely (not just zero-weighted), and `loss` is the other
+    term alone, ignoring `ctc_weight`. Returns (loss, ctc_loss, ce_loss); the
+    skipped side's entry is None -- callers that log/CSV-write these must
+    handle that (see run_training's main loop)."""
+    ctc_loss = None
+    if ctc_logits is not None:
+        b, t_max, _ = ctc_logits.shape
+        log_probs = F.log_softmax(ctc_logits, dim=-1).transpose(0, 1)  # (T,N,C)
+        # Real per-sample encoder lengths, not t_max: enc_out is zero-padded up to
+        # the batch's longest line, and claiming those padding frames are real
+        # input makes CTC align targets against blank padding.
+        if enc_lengths is not None:
+            ctc_input_lengths = enc_lengths.to(dtype=torch.long, device=ctc_logits.device)
+        else:
+            ctc_input_lengths = torch.full((b,), t_max, dtype=torch.long, device=ctc_logits.device)
+        # CTCLoss expects the blank id to match the logits' extra class; ctc_head
+        # appends it at index vocab_size, so remap that here explicitly.
+        ctc_loss = F.ctc_loss(
+            log_probs, batch["ctc_targets"], ctc_input_lengths, batch["ctc_lengths"],
+            blank=ctc_blank_id, zero_infinity=True,
+        )
+
+    ce_loss = None
+    if ar_logits is not None:
+        # ar_targets: whichever target tensor matches ar_logits' shape for the mode this
+        # step ran in -- (B, num_blocks, K) for blockwise, (B, L) flat for sequential (see
+        # run_training's ar_mode/ar_targets_for_mode). Defaults to batch["ar_targets"] for
+        # callers that don't pass it explicitly (e.g. find_max_batch_size's OOM probe,
+        # which always probes blockwise mode).
+        if ar_targets is None:
+            ar_targets = batch["ar_targets"]
+        ce_loss = F.cross_entropy(
+            ar_logits.reshape(-1, ar_logits.shape[-1]), ar_targets.reshape(-1),
+            ignore_index=pad_id,
+        )
+
+    if ctc_loss is not None and ce_loss is not None:
+        loss = ctc_weight * ctc_loss + (1 - ctc_weight) * ce_loss
+    elif ctc_loss is not None:
+        loss = ctc_loss
+    elif ce_loss is not None:
+        loss = ce_loss
     else:
-        ctc_input_lengths = torch.full((b,), t_max, dtype=torch.long, device=ctc_logits.device)
-    # CTCLoss expects the blank id to match the logits' extra class; ctc_head
-    # appends it at index vocab_size, so remap that here explicitly.
-    ctc_loss = F.ctc_loss(
-        log_probs, batch["ctc_targets"], ctc_input_lengths, batch["ctc_lengths"],
-        blank=ctc_blank_id, zero_infinity=True,
-    )
-    # ar_targets: whichever target tensor matches ar_logits' shape for the mode this
-    # step ran in -- (B, num_blocks, K) for blockwise, (B, L) flat for sequential (see
-    # run_training's ar_mode/ar_targets_for_mode). Defaults to batch["ar_targets"] for
-    # callers that don't pass it explicitly (e.g. find_max_batch_size's OOM probe,
-    # which always probes blockwise mode).
-    if ar_targets is None:
-        ar_targets = batch["ar_targets"]
-    ce_loss = F.cross_entropy(
-        ar_logits.reshape(-1, ar_logits.shape[-1]), ar_targets.reshape(-1),
-        ignore_index=pad_id,
-    )
-    loss = ctc_weight * ctc_loss + (1 - ctc_weight) * ce_loss
+        raise ValueError("compute_loss: both ctc_logits and ar_logits are None -- nothing to train")
     return loss, ctc_loss, ce_loss
 
 
 @torch.no_grad()
 def log_inference_samples(model, tokenizer, model_cfg, samples, device, logger, step, char_vocab=None,
-                          mode: str = "blockwise"):
+                          mode: str = "blockwise", compute_ctc: bool = True):
     """Greedy-decodes a handful of fixed held-out samples and logs
     prediction vs ground truth -- a cheap, human-readable sanity check that
     the model is actually learning to read (not just that the loss number
-    is dropping), run periodically alongside the numeric metrics."""
+    is dropping), run periodically alongside the numeric metrics.
+
+    compute_ctc=False skips the CTC read-out entirely (for the AR-only
+    ablation notebook, where the CTC head never trains and its preview text
+    would be meaningless) -- matches model.forward's compute_ctc flag."""
     was_training = model.training
     model.eval()
     for i, sample in enumerate(samples):
@@ -221,7 +246,7 @@ def log_inference_samples(model, tokenizer, model_cfg, samples, device, logger, 
         # not exposed to the decoder's exposure bias, so it is the earliest
         # honest signal that the encoder is learning to SEE text at all.
         ctc_txt = ""
-        if char_vocab is not None:
+        if compute_ctc and char_vocab is not None:
             # One device->host transfer for the whole row -- indexing the GPU
             # tensor per frame costs a sync per frame.
             n = int(enc_lengths[0])
@@ -252,13 +277,19 @@ def _scaled_width(sample, img_height: int) -> int:
 
 
 def evaluate_val_cer(model, tokenizer, model_cfg, val_samples, device, char_vocab, mode: str = "blockwise",
-                     ar_limit: int = None, batch_size: int = 16):
+                     ar_limit: int = None, batch_size: int = 16, compute_ctc: bool = True):
     """Greedy-decodes held-out samples and returns
     (ar_cer, ctc_cer, n_ar, n_ctc) -- real quantitative numbers to track
     alongside the loss (loss can keep falling on train while val CER climbs;
     that gap is the overfitting signal). AR CER is the decoder's read-out,
     CTC CER the encoder's alignment-free read-out. Runs in eval mode,
     restores train mode on exit; no grad.
+
+    compute_ctc=False skips the CTC CER pass entirely (returns nan/n_ctc=0)
+    -- for the AR-only ablation notebook, where the CTC head never trains
+    and its CER is meaningless. ar_limit=0 is the AR-side equivalent
+    (already used by the CTC-only notebook) -- see its own docstring line
+    below.
 
     The two metrics are priced very differently and so are sampled
     differently: the CTC read-out is an argmax over an encoder pass, while
@@ -313,13 +344,14 @@ def evaluate_val_cer(model, tokenizer, model_cfg, val_samples, device, char_voca
 
     with torch.no_grad():
         # CTC CER over the full pool: argmax + collapse, one transfer per batch.
-        for group in batches(val_samples):
-            (enc_out, enc_lengths, _), _ = encode_batch(group)
-            ids = model.ctc_head(enc_out).argmax(-1).cpu()
-            lengths = enc_lengths.cpu().tolist()
-            for sample, row, n in zip(group, ids.tolist(), lengths):
-                ctc_refs.append(sample.text)
-                ctc_hyps.append(char_vocab.decode(_collapse_ctc(row[:n], char_vocab.blank_id)))
+        if compute_ctc:
+            for group in batches(val_samples):
+                (enc_out, enc_lengths, _), _ = encode_batch(group)
+                ids = model.ctc_head(enc_out).argmax(-1).cpu()
+                lengths = enc_lengths.cpu().tolist()
+                for sample, row, n in zip(group, ids.tolist(), lengths):
+                    ctc_refs.append(sample.text)
+                    ctc_hyps.append(char_vocab.decode(_collapse_ctc(row[:n], char_vocab.blank_id)))
 
         # AR CER over the capped pool (re-encodes those lines; the encoder
         # pass is ~26ms/sample, noise next to the decode it feeds).
@@ -349,10 +381,17 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
                   tokenizer_dir=TOKENIZER_ASSETS_DIR, checkpoint_root=DEFAULT_CHECKPOINT_ROOT, run_name: str = "v1",
                   push_to_hub: bool = False, repo_id=None, hf_token=None, hub_private: bool = True,
                   auto_batch_size: bool = False, resume_path=None, device=None, unify_ctc_tokenizer: bool = False,
-                  hub_path_prefix: str = ""):
+                  hub_path_prefix: str = "", train_ctc: bool = True, train_ar: bool = True):
     """Exactly one of `dedup_manifest_path` (preferred -- output of
     `real_data.deduplicate`) or `real_data_roots` (raw, undeduplicated
     per-source manifests) must be given.
+
+    train_ctc/train_ar: set either False to exclude that head from training
+    ENTIRELY -- not just zero-weighted (TrainConfig.ctc_weight already did
+    that), but zero compute: model.forward skips that head's layers, its
+    loss term is never computed, and its CER/preview text are skipped in
+    both the periodic eval and the sample log. For the CTC-only/AR-only
+    ablation notebooks. At least one of the two must stay True.
 
     hub_path_prefix: when set (e.g. "ctc_only"), checkpoints push to that
     folder within `repo_id` (`ctc_only/step_0002000.pt`) instead of the repo
@@ -370,6 +409,8 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
     rejected but character-AR is fine. Do not set this for the production
     two-head run -- the AR decoder is meant to output the shared subword
     vocab (see recognizer/README.md)."""
+    if not train_ctc and not train_ar:
+        raise ValueError("run_training: train_ctc and train_ar can't both be False -- nothing to train")
     device = device or env_utils.get_torch_device()
     is_xla = device.type == "xla"
     xm = None
@@ -493,7 +534,8 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
         modes_to_probe = ["blockwise"] if train_cfg.sequential_ar_steps <= 0 else ["sequential", "blockwise"]
         batch_size = min(
             find_max_batch_size(model, train_ds, collate_fn, device, widths,
-                                start=max(64, train_cfg.batch_size), mode=mode)
+                                start=max(64, train_cfg.batch_size), mode=mode,
+                                compute_ctc=train_ctc, compute_ar=train_ar)
             for mode in modes_to_probe
         )
         logger.info(f"auto batch size: {batch_size} (probed mode(s): {', '.join(modes_to_probe)})")
@@ -629,7 +671,8 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
                 batch = move_batch(batch, device)
                 ar_targets_for_mode = batch["ar_flat_targets"] if ar_mode == "sequential" else batch["ar_targets"]
                 ctc_logits, ar_logits, enc_lengths = model(
-                    batch["chunks"], batch["chunks_per_line"], ar_targets_for_mode, mode=ar_mode)
+                    batch["chunks"], batch["chunks_per_line"], ar_targets_for_mode, mode=ar_mode,
+                    compute_ctc=train_ctc, compute_ar=train_ar)
                 loss, ctc_loss, ce_loss = compute_loss(
                     ctc_logits, ar_logits, batch, train_cfg.ctc_weight, tokenizer.pad_id, ctc_blank_id,
                     enc_lengths=enc_lengths, ar_targets=ar_targets_for_mode,
@@ -710,20 +753,27 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
                 elapsed = time.time() - t0
                 epoch = step / steps_per_epoch
                 oom_note = f" oom_skips {oom_skips}" if oom_skips else ""
-                logger.info(f"step {step} epoch {epoch:.2f} loss {loss.item():.4f} ctc {ctc_loss.item():.4f} "
-                            f"ce {ce_loss.item():.4f} lr {lr:.2e} ({elapsed:.1f}s){oom_note}")
+                # ctc_loss/ce_loss are None when train_ctc/train_ar disabled that head
+                # (see compute_loss) -- "n/a" in the log, empty cell in the CSV rather
+                # than crashing on None.item().
+                ctc_loss_str = f"{ctc_loss.item():.4f}" if ctc_loss is not None else "n/a"
+                ce_loss_str = f"{ce_loss.item():.4f}" if ce_loss is not None else "n/a"
+                logger.info(f"step {step} epoch {epoch:.2f} loss {loss.item():.4f} ctc {ctc_loss_str} "
+                            f"ce {ce_loss_str} lr {lr:.2e} ({elapsed:.1f}s){oom_note}")
                 with log_path.open("a", newline="") as f:
-                    csv.writer(f).writerow([step, f"{epoch:.4f}", loss.item(), ctc_loss.item(), ce_loss.item(), lr])
+                    csv.writer(f).writerow([step, f"{epoch:.4f}", loss.item(),
+                                            ctc_loss.item() if ctc_loss is not None else "",
+                                            ce_loss.item() if ce_loss is not None else "", lr])
 
             if train_cfg.sample_every > 0 and step % train_cfg.sample_every == 0 and inference_samples:
                 log_inference_samples(model, tokenizer, model_cfg, inference_samples, device, logger, step,
-                                      char_vocab=char_vocab, mode=ar_mode)
+                                      char_vocab=char_vocab, mode=ar_mode, compute_ctc=train_ctc)
 
             if train_cfg.eval_every > 0 and step % train_cfg.eval_every == 0 and eval_samples:
                 t_eval = time.time()
                 ar_cer, ctc_cer, n_ar, n_ctc = evaluate_val_cer(
                     model, tokenizer, model_cfg, eval_samples, device, char_vocab, mode=ar_mode,
-                    ar_limit=train_cfg.max_ar_eval_samples)
+                    ar_limit=train_cfg.max_ar_eval_samples, compute_ctc=train_ctc)
                 epoch = step / steps_per_epoch
                 logger.info(f"eval step {step} epoch {epoch:.2f} val_ar_cer {ar_cer:.4f} (n={n_ar}) "
                             f"val_ctc_cer {ctc_cer:.4f} (n={n_ctc} of {len(val_samples)} held out) "
