@@ -7,7 +7,7 @@ TOKENIZER_ASSETS_DIR = RECOGNIZER_ROOT / "tokenizer" / "assets"
 DEFAULT_CHECKPOINT_ROOT = RECOGNIZER_ROOT / "checkpoints"
 
 TOKENIZER_HUB_ID = "Panhapich/khmer-sp-8k"
-HF_MODEL_REPO_ID = "Panhapich/tuna-ocr"
+HF_MODEL_REPO_ID = "Panhapich/Tuna-OCR"
 
 # Language-tag ids appended past the base 8000-token SentencePiece vocab.
 # <blk> is intentionally not here -- see KhmerOcrTokenizer's <eob>.

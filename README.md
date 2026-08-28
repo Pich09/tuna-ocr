@@ -175,7 +175,7 @@ needed on any platform:
 - **CPU**: works, just slow — fine for the kind of small smoke-test run
   used to validate the pipeline end-to-end.
 
-Checkpoints are pushed to the `Panhapich/tuna-ocr` Hugging Face repo every
+Checkpoints are pushed to the `Panhapich/Tuna-OCR` Hugging Face repo every
 10,000 steps (created **private** by default).
 
 ## Tokenizer

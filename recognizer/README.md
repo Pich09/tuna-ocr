@@ -11,7 +11,7 @@ part of this training pipeline.
 recognizer/
   config.py                 ModelConfig, TrainConfig
   env_utils.py               Colab/Kaggle/local environment detection, Drive mount, HF secrets
-  hf_push.py                  pushes a checkpoint to the Panhapich/tuna-ocr HF repo
+  hf_push.py                  pushes a checkpoint to the Panhapich/Tuna-OCR HF repo
   tokenizer/
     fetch_tokenizer.py        CLI: downloads Panhapich/khmer-sp-8k assets
     khmer_ocr_tokenizer.py     KhmerOcrTokenizer wrapper
@@ -241,7 +241,7 @@ python -m recognizer.train --dedup-manifest real_data/samples/dedup/manifest.tsv
 ```
 
 For Colab/Kaggle/local with adaptive batch sizing and automatic checkpoint
-push to the `Panhapich/tuna-ocr` HF repo, use
+push to the `Panhapich/Tuna-OCR` HF repo, use
 `notebooks/train_recognizer.ipynb` instead of the bare CLI -- see its first
 cell for platform setup (Drive mount, HF secret name: `HF_TOKEN`).
 
