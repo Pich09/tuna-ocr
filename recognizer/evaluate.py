@@ -5,7 +5,7 @@ segmentation-heuristic agreement rather than recognition accuracy. Also
 reports a CTC-only greedy decode CER as an independent sanity check.
 
 Usage:
-    python -m recognizer.evaluate --checkpoint recognizer/checkpoints/v1/last.pt \\
+    python -m recognizer.evaluate --checkpoint recognizer/checkpoints/v1/latest.pt \\
         --real-data-dirs real_data/samples/darayut_scene_text --tokenizer-dir recognizer/tokenizer/assets
 """
 import argparse

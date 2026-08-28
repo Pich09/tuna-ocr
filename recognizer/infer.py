@@ -1,7 +1,7 @@
 """Single-image inference CLI.
 
 Usage:
-    python -m recognizer.infer --checkpoint recognizer/checkpoints/v1/last.pt \\
+    python -m recognizer.infer --checkpoint recognizer/checkpoints/v1/latest.pt \\
         --image line.jpg --tokenizer-dir recognizer/tokenizer/assets
 """
 import argparse

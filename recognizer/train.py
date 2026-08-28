@@ -29,6 +29,7 @@ directly instead of shelling out to this CLI.
 import argparse
 import csv
 import gc
+import json
 import logging
 import math
 import os
@@ -63,7 +64,7 @@ from .data.dataset import (BucketBatchSampler, OCRLineDataset, compute_widths, m
                            find_unlearnable, move_batch, truncation_stats)
 from .data.manifest import build_combined_index, load_dedup_manifest
 from .data.transforms import chunk_line_image
-from .hf_push import push_checkpoint
+from .hf_push import pull_metadata, push_checkpoint
 from .modules.decoder import truncate_at_eos, truncate_blocks
 from .modules.model import Recognizer
 from .tokenizer.khmer_ocr_tokenizer import KhmerOcrTokenizer
@@ -413,11 +414,12 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
     ablation notebooks. At least one of the two must stay True.
 
     hub_path_prefix: when set (e.g. "ctc_only"), checkpoints push to that
-    folder within `repo_id` (`ctc_only/step_0002000.pt`) instead of the repo
-    root -- lets several independent runs share ONE Hub repo without their
-    step-numbered filenames colliding. The caller is responsible for pulling
-    from the SAME prefix on resume (hf_push.pull_latest_checkpoint's own
-    `path_prefix` arg) -- this only controls where run_training PUSHES to.
+    folder within `repo_id` (`ctc_only/latest.pt`, `ctc_only/best.pt`,
+    `ctc_only/metadata.json`) instead of the repo root -- lets several
+    independent runs share ONE Hub repo without their files colliding. The
+    caller is responsible for pulling from the SAME prefix on resume
+    (hf_push.pull_latest_checkpoint's own `path_prefix` arg) -- this only
+    controls where run_training PUSHES to.
 
     unify_ctc_tokenizer: when True, the AR decoder trains against the SAME
     character-level tokenizer as the CTC head (tokenizer/char_tokenizer.py's
@@ -663,12 +665,37 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
         logger.info(f"resumed from {resume_path} at step {step} "
                     f"({train_cfg.max_steps - step} steps remaining to max_steps={train_cfg.max_steps})")
 
+    # Recover best-checkpoint bookkeeping from the Hub's metadata.json (see
+    # push_checkpoint's ckpt_every block below) so a resumed run keeps
+    # comparing new checkpoints against the REAL best instead of resetting
+    # to "no best yet" and overwriting a genuinely better best.pt the first
+    # time this run's own eval happens to be worse. None (fresh run, or a
+    # repo still on the legacy per-step scheme with no metadata.json yet)
+    # just starts best-tracking from scratch, same as before.
+    best_metric = float("inf")
+    best_step = None
+    if push_to_hub:
+        kwargs_meta = {"token": hf_token, "path_prefix": hub_path_prefix}
+        if repo_id:
+            kwargs_meta["repo_id"] = repo_id
+        meta = pull_metadata(**kwargs_meta)
+        if meta and meta.get("best_metric") is not None:
+            best_metric = meta["best_metric"]
+            best_step = meta.get("best_step")
+            logger.info(f"resumed best-checkpoint tracking from the Hub's metadata.json: "
+                        f"best_metric={best_metric:.4f} at step {best_step}")
+
     ctc_blank_id = char_vocab.blank_id
     if train_cfg.sequential_ar_steps > 0:
         logger.info(f"AR decoder training curriculum: sequential mode for steps 0-"
                     f"{train_cfg.sequential_ar_steps} (plain teacher forcing, unrestricted "
                     f"cross-attention -- see modules/decoder.py), then blockwise for the rest.")
     ar_mode_logged_switch = train_cfg.sequential_ar_steps <= 0  # already "switched" if disabled from the start
+    # Last-known eval numbers, carried forward between eval_every boundaries so the
+    # ckpt_every block (a different, usually-coarser cadence) always has something to
+    # compare a new checkpoint against instead of only right after an eval just ran.
+    last_ar_cer = None
+    last_ctc_cer = None
     oom_skips = 0          # total OOMs across the whole run, for visibility in the logs
     consecutive_oom = 0    # resets to 0 on any successful step -- see the except block
                            # below, and TrainConfig.max_consecutive_oom's docstring for
@@ -793,6 +820,7 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
                 ar_cer, ctc_cer, n_ar, n_ctc = evaluate_val_cer(
                     model, tokenizer, model_cfg, eval_samples, device, char_vocab, mode=ar_mode,
                     ar_limit=train_cfg.max_ar_eval_samples, compute_ctc=train_ctc)
+                last_ar_cer, last_ctc_cer = ar_cer, ctc_cer
                 epoch = step / steps_per_epoch
                 logger.info(f"eval step {step} epoch {epoch:.2f} val_ar_cer {ar_cer:.4f} (n={n_ar}) "
                             f"val_ctc_cer {ctc_cer:.4f} (n={n_ctc} of {len(val_samples)} held out) "
@@ -805,7 +833,6 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
                     csv.writer(f).writerow([step, f"{epoch:.4f}", f"{ar_cer:.4f}", f"{ctc_cer:.4f}"])
 
             if step % train_cfg.ckpt_every == 0:
-                ckpt_path = ckpt_dir / f"step_{step:07d}.pt"
                 state = {
                     "step": step, "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
@@ -819,16 +846,47 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
                     "train_cfg_max_steps": train_cfg.max_steps,
                 }
                 save_fn = xm.save if is_xla else torch.save  # xm.save moves XLA tensors to CPU before writing
-                save_fn(state, ckpt_path)
-                save_fn(state, ckpt_dir / "last.pt")
-                logger.info(f"saved checkpoint {ckpt_path} (and {ckpt_dir / 'last.pt'} -- "
-                            f"resume from either with --resume)")
+                latest_path = ckpt_dir / "latest.pt"
+                save_fn(state, latest_path)
+                logger.info(f"saved checkpoint {latest_path} (resume from it with --resume)")
+
+                # Composite "how good is this checkpoint" metric: the sum of whichever
+                # CER(s) are actually being trained/measured -- evaluate_val_cer returns
+                # nan for a head that's disabled (train_ctc=False) or wasn't sampled this
+                # eval (max_ar_eval_samples=0), so those are excluded rather than poisoning
+                # the sum. Lower is better. None if no eval has happened yet at all (e.g.
+                # eval_every=0, or the very first checkpoint lands before the first
+                # eval_every boundary) -- nothing to compare against yet, so this round
+                # only updates latest.pt, not best.pt.
+                current_metric = None
+                if last_ar_cer is not None or last_ctc_cer is not None:
+                    parts = [v for v in (last_ar_cer, last_ctc_cer) if v is not None and not math.isnan(v)]
+                    current_metric = sum(parts) if parts else None
+
+                is_new_best = current_metric is not None and current_metric < best_metric
+                if is_new_best:
+                    best_metric, best_step = current_metric, step
+                    save_fn(state, ckpt_dir / "best.pt")
+                    logger.info(f"step {step}: new best checkpoint (metric {best_metric:.4f}, "
+                                f"val_ar_cer={last_ar_cer}, val_ctc_cer={last_ctc_cer})")
+
+                metadata_path = ckpt_dir / "metadata.json"
+                metadata_path.write_text(json.dumps({
+                    "latest_step": step, "best_step": best_step,
+                    "best_metric": None if best_metric == float("inf") else best_metric,
+                    "val_ar_cer": last_ar_cer, "val_ctc_cer": last_ctc_cer,
+                }, indent=2))
+
                 if push_to_hub:
                     kwargs = {"token": hf_token, "private": hub_private, "path_prefix": hub_path_prefix}
                     if repo_id:
                         kwargs["repo_id"] = repo_id
-                    url = push_checkpoint(ckpt_path, **kwargs)
-                    logger.info(f"pushed checkpoint to {url}")
+                    url = push_checkpoint(latest_path, **kwargs)
+                    logger.info(f"pushed latest checkpoint to {url}")
+                    if is_new_best:
+                        best_url = push_checkpoint(ckpt_dir / "best.pt", **kwargs)
+                        logger.info(f"pushed best checkpoint to {best_url}")
+                    push_checkpoint(metadata_path, **kwargs)
 
     oom_note = f", {oom_skips} batches skipped due to CUDA OOM" if oom_skips else ""
     logger.info(f"training complete: {step} steps, checkpoints + log in {ckpt_dir}{oom_note}")
