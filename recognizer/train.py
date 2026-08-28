@@ -547,12 +547,20 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
 
     batch_size = train_cfg.batch_size
     if auto_batch_size and device.type == "cuda":
-        # Probe every AR mode the run could start in: a fresh or resumed-before-
-        # the-switch run starts in "sequential" mode, whose growing-prefix
+        # Probe every AR mode the run could ACTUALLY reach: a fresh or resumed-
+        # before-the-switch run starts in "sequential" mode, whose growing-prefix
         # attention has a different memory profile than "blockwise" (see
         # find_max_batch_size's docstring) -- probing only blockwise can pass at
         # a batch size that then OOMs once sequential-mode steps actually run.
-        modes_to_probe = ["blockwise"] if train_cfg.sequential_ar_steps <= 0 else ["sequential", "blockwise"]
+        # sequential_ar_steps >= max_steps (e.g. a sequential-only comparison run)
+        # means blockwise is never reached at all, so skip probing it -- wasted
+        # GPU time for a mode this run will never enter.
+        if train_cfg.sequential_ar_steps <= 0:
+            modes_to_probe = ["blockwise"]
+        elif train_cfg.sequential_ar_steps >= train_cfg.max_steps:
+            modes_to_probe = ["sequential"]
+        else:
+            modes_to_probe = ["sequential", "blockwise"]
         batch_size = min(
             find_max_batch_size(model, train_ds, collate_fn, device, widths,
                                 start=max(64, train_cfg.batch_size), mode=mode,
@@ -686,7 +694,12 @@ def run_training(model_cfg: ModelConfig, train_cfg: TrainConfig, real_data_roots
                         f"best_metric={best_metric:.4f} at step {best_step}")
 
     ctc_blank_id = char_vocab.blank_id
-    if train_cfg.sequential_ar_steps > 0:
+    if train_cfg.sequential_ar_steps >= train_cfg.max_steps:
+        logger.info(f"AR decoder training curriculum: sequential mode (plain teacher forcing, "
+                    f"unrestricted cross-attention -- see modules/decoder.py) for the ENTIRE run "
+                    f"-- sequential_ar_steps ({train_cfg.sequential_ar_steps}) >= max_steps "
+                    f"({train_cfg.max_steps}), so blockwise mode is never reached.")
+    elif train_cfg.sequential_ar_steps > 0:
         logger.info(f"AR decoder training curriculum: sequential mode for steps 0-"
                     f"{train_cfg.sequential_ar_steps} (plain teacher forcing, unrestricted "
                     f"cross-attention -- see modules/decoder.py), then blockwise for the rest.")
