@@ -237,7 +237,8 @@ class BlockwiseARDecoder(nn.Module):
 
     @torch.no_grad()
     def decode_greedy_sequential(self, enc_out: torch.Tensor, enc_lengths: torch.Tensor,
-                                  max_len: int = 256) -> torch.Tensor:
+                                  max_len: int = 256, repetition_penalty: float = 1.0,
+                                  repetition_window: int = 8) -> torch.Tensor:
         """Ordinary one-token-at-a-time greedy decoding (recomputes the whole
         prefix each step -- same known v1 no-KV-cache simplification as
         decode_greedy). Returns (B, <=max_len) token ids, NOT including the
@@ -247,7 +248,19 @@ class BlockwiseARDecoder(nn.Module):
         max_len=256 iterations -- measured as the dominant cost of the
         periodic eval -- and the post-<eos> positions are garbage anyway.
         Rows that finish early keep generating <pad> so the batch stays
-        rectangular."""
+        rectangular.
+
+        `repetition_penalty` (CTRL-style: divides a positive logit, multiplies
+        a negative one, so it always pushes the score down): 1.0 (default) is
+        an exact no-op, preserving the original behavior for every existing
+        caller -- notably recognizer/train.py's periodic eval, so past/live
+        training runs' val_ar_cer curves and best.pt selection are unaffected
+        by this. Only applied to token ids seen in the last
+        `repetition_window` generated positions (not the whole history), so
+        it targets the specific short-range loop/copy failure mode observed
+        in eval (e.g. "GB+512 GB+512 GB+512") without discouraging legitimate
+        longer-range reuse of common Khmer syllables/characters elsewhere in
+        a line. Pass repetition_penalty > 1.0 (e.g. 1.3) to enable."""
         b = enc_out.shape[0]
         device = enc_out.device
         t_enc = enc_out.shape[1]
@@ -263,6 +276,14 @@ class BlockwiseARDecoder(nn.Module):
                 x = layer(x, enc_out, causal, cross_mask)
             x = self.ln_final(x)
             next_logits = self.token_head(x[:, -1, :])
+            if repetition_penalty != 1.0:
+                window_start = max(1, generated.shape[1] - repetition_window)
+                recent = generated[:, window_start:]  # (B, w); never includes the leading <bos> at position 0
+                recent_mask = torch.zeros_like(next_logits, dtype=torch.bool)
+                recent_mask.scatter_(1, recent, True)
+                positive = next_logits > 0
+                next_logits = torch.where(recent_mask & positive, next_logits / repetition_penalty, next_logits)
+                next_logits = torch.where(recent_mask & ~positive, next_logits * repetition_penalty, next_logits)
             next_tok = next_logits.argmax(dim=-1, keepdim=True)
             if self.eos_id is not None:
                 next_tok = next_tok.masked_fill(finished.unsqueeze(1), self.pad_id)
